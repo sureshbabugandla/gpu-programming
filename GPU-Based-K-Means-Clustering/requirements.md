@@ -5,8 +5,8 @@
 | Document type | Software Requirements Specification (Specification-Driven Development) |
 | Project | Problem 5: GPU-Based K-Means Clustering |
 | Stage | Stage 1 — Specification (no implementation code) |
-| Version | 1.7 |
-| Status | Specification complete; Stage 2 may begin once machine-dependent items in §1.6.2 are recorded |
+| Version | 1.8 |
+| Status | Specification complete; machine-dependent items recorded (§1.6.2, evidence `results/kmeans_cuda_M0.ipynb`); Stage 2 in progress |
 | Normative keywords | **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, **MAY** as in RFC 2119 |
 
 ### 0.1 Conventions
@@ -69,7 +69,7 @@ Implement Lloyd's K-Means algorithm on an NVIDIA GPU using CUDA. Given $N$ point
 
 ### 1.6 Assumptions and unresolved environment items
 
-The supervisor has confirmed that the problem statement is the complete brief: no datasets, sizes, language, build system or output format are prescribed. Items that depended on further guidance are therefore closed as engineering decisions (§1.6.1). Items that depend on the physical machine remain open and are resolved by recording the student's own environment (§1.6.2). No hardware, compiler version or benchmark number in this document is presumed.
+The supervisor has confirmed that the problem statement is the complete brief: no datasets, sizes, language, build system or output format are prescribed. Items that depended on further guidance are therefore closed as engineering decisions (§1.6.1). Items that depend on the physical machine were resolved by recording the environment actually used (§1.6.2). No hardware, compiler version or benchmark number in this document is presumed.
 
 #### 1.6.1 Closed items (decided in this specification)
 
@@ -82,17 +82,23 @@ The supervisor has confirmed that the problem statement is the complete brief: n
 | ENV-09 | Output format | Binary `.kmd`/`.kma` files plus JSON run summary (BLD-004) and CSV benchmark files (§13.1) | Problem statement lists output contents, not format |
 | ENV-10 | Interpretation of "movement becomes smaller than a specified tolerance" | $\Delta \le \varepsilon$ (inclusive), DEC-002 | With strict $<$, $\varepsilon = 0$ could never trigger the movement criterion; inclusive comparison makes $\varepsilon=0$ mean "no movement". Strict and inclusive differ only when $\Delta$ equals $\varepsilon$ exactly. |
 
-#### 1.6.2 Open items (record from the student's machine before Stage 2)
+#### 1.6.2 Recorded environment (closed; evidence `results/kmeans_cuda_M0.ipynb`)
 
-These cannot be decided by specification; they are facts about the hardware used. Each is resolved by running the listed command and recording the output in the notebook environment cell and in every benchmark CSV row (PERF-008).
+These cannot be decided by specification; they are facts about the hardware used. All items are now
+**recorded** from one executed Colab GPU session, saved as `results/kmeans_cuda_M0.ipynb` (M0,
+2026-10-17), which is the Stage 3 evidence for every value below (DEC-012). ENV-01, ENV-02, ENV-03
+and ENV-08 come from the notebook's environment cell and toolchain smoke test; ENV-06 is not
+queryable and is cited from NVIDIA documentation. Every benchmark CSV row repeats these fields
+(PERF-008). A later session that is assigned a different GPU invalidates this record and MUST
+re-record it before its rows are used (BLD-001c).
 
-| ID | Item | How to record | Default assumed | Impact if different |
-|---|---|---|---|---|
-| ENV-01 | GPU model and compute capability | `!nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total --format=csv` | CC ≥ 6.0 `[ASM]` | Below 6.0, native `atomicAdd(double)` is unavailable; ATOM-003 would need a CAS-loop fallback (spec change per §18.4). |
-| ENV-02 | CUDA toolkit and driver version | `!nvcc --version`; `!nvidia-smi` | Toolkit supports the GPU and ships `compute-sanitizer` `[ASM]` | `-arch` flags; sanitizer availability. |
-| ENV-03 | Host OS and host compiler of the Colab VM | `!cat /etc/os-release`, `!g++ --version` | Linux + g++ (Colab) `[ASM]` | Compiler flags in BLD-002. |
-| ENV-06 | FP64 throughput of the GPU | Look up the GPU's FP64:FP32 ratio from the vendor specification for the recorded model | Unknown | Low FP64 rate (typical on consumer GPUs) affects interpretation of both strategies and motivates OPT-002. |
-| ENV-08 | Profiler availability | `!nsys --version`, `!ncu --version` | Available `[ASM]` | If absent, PERF-009 and TEST-P03 fall back to CUDA-event phase timing (PERF-007); recorded as a limitation. |
+| ID | Item | Recorded value | Consequence for the implementation |
+|---|---|---|---|
+| ENV-01 | GPU model and compute capability | **Tesla T4**, compute capability **7.5**, **40** SMs, 15360 MiB reported by `nvidia-smi` (15 637 086 208 B total global memory from `cudaGetDeviceProperties`), 49 152 B (48 KiB) shared memory per block with 65 536 B (64 KiB) opt-in, warp size 32, 1024 max threads per block, driver **580.82.07**, 1 GPU visible | CC 7.5 ≥ 6.0, so native `atomicAdd(double)` is available and ATOM-003 needs no CAS fallback. `SM_ARCH = sm_75`. SM count 40 sizes grids (CUDA-007: $32\times40 = 1280$ blocks) and $T_{\text{target}} = 2048\times40 = 81\,920$ for the Approach B chunk count $G$ (RED-006). 48 KiB per block bounds `assign_smem` tiles (SMEM-003: 1 KiB at $T_K{=}8$, $T_D{=}32$) and `reduce_stage2` (MEM-004: 2 080 B), both far inside the limit. 15 GB bounds the PERF-003 sizes (MEM-002, VAL-009). |
+| ENV-02 | CUDA toolkit and driver version | `nvcc` release **13.0, V13.0.88** (built 2025-08-20); CUDA runtime and driver both report version 13000 (13.0); `compute-sanitizer` present | BLD-001a is satisfied exactly at its boundary: CUDA 13.x dropped offline compilation below CC 7.5, and this device is CC 7.5, so the 13.0 toolkit is usable with `-arch=sm_75`. The sanitizer suite (TEST-S01–S04) can run. |
+| ENV-03 | Host OS and host compiler of the Colab VM | **Ubuntu 24.04.4 LTS** (Noble Numbat), kernel 6.6.122+, glibc 2.39, Python 3.13.15; host compiler **g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0** | g++ 13.3 supports C++17 (BLD-001) and `-ffp-contract=off` for the CPU reference oracle (NUM-003, BLD-002). numpy 2.1.3, pandas 2.2.3, matplotlib 3.10.0 are preinstalled for the analysis cells. |
+| ENV-06 | FP64 throughput of the GPU | Cited, not measured, from NVIDIA documentation for the recorded model: single-precision **8.1 TFLOPS**, memory bandwidth **300 GB/sec**, 2 560 CUDA cores, 16 GB GDDR6 ([NVIDIA T4 datasheet](https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/tesla-t4/t4-tensor-core-datasheet-951643.pdf), MAR19). The datasheet lists **no** FP64 figure; for Turing, "two per SM" FP64 units give an FP64 rate that "is 1/32nd the TFLOP rate of FP32 operations" ([NVIDIA Turing Architecture In-Depth](https://developer.nvidia.com/blog/nvidia-turing-architecture-in-depth/)), i.e. **FP64:FP32 = 1:32**, so ≈ 0.25 TFLOPS FP64 (derived from the two cited figures, not measured) | A 1:32 FP64 rate is the central fact for interpreting §13: both strategies accumulate centroid sums in binary64 (DEC-007), so Approach A's `atomicAdd(double)` traffic and Approach B's binary64 partial-sum RMWs are executed on 2 of 64 lanes per SM. This motivates OPT-002 (FP32 accumulation as a measured variant) and must be stated in the PERF-010 analysis before any claim about which strategy is faster. |
+| ENV-08 | Profiler availability | `compute-sanitizer` present; **Nsight Systems 2025.3.1.0**; `ncu` (Nsight Compute CLI) present. The M0 environment cell printed only the first line of `--version` for `compute-sanitizer` and `ncu`, so their exact version strings are not in the M0 record; the cell now captures the version line and the next executed notebook completes this row | Profilers available, so PERF-009 (Nsight Compute metrics) and TEST-P03 (Nsight Systems transfer trace) can be attempted rather than falling back to CUDA-event phase timing (PERF-007). Colab may still restrict profiling counters; if so, the fallback applies and is recorded as a limitation. |
 
 ---
 
@@ -1144,7 +1150,7 @@ Exit criteria (all MUST hold before Stage 2):
 - [x] Environment items listed (§1.6).
 - [x] Supervisor brief confirmed as the problem statement only; guidance-dependent items closed (ENV-04, 05, 07, 09, 10).
 - [x] Runtime selected: Google Colab GPU (ENV-11).
-- [ ] Machine-dependent items ENV-01, 02, 03, 06, 08 recorded from a Colab GPU session — **pending** (first task of Stage 2, before any kernel is written).
+- [x] Machine-dependent items ENV-01, 02, 03, 06, 08 recorded from a Colab GPU session — **done** in M0: Tesla T4, CC 7.5, 40 SMs, CUDA 13.0, driver 580.82.07, Ubuntu 24.04.4 with g++ 13.3.0, profilers present, FP64:FP32 = 1:32 cited. Evidence: `results/kmeans_cuda_M0.ipynb` (§1.6.2).
 
 ### 18.2 Stage 2 — Implementation
 
@@ -1205,7 +1211,7 @@ Optional items, including the cross-GPU comparison (OPT-006, PERF-012), are not 
 | No hardware or toolchain invented | Yes; only minimum CC 6.0 required, marked `[ASM]` |
 | Stages separate; no CUDA source in this document | Yes |
 | Interpretation of "smaller than tolerance" | Closed: $\Delta \le \varepsilon$ (ENV-10) |
-| Remaining open points | Machine-dependent facts only (§1.6.2) |
+| Remaining open points | None. The machine-dependent facts of §1.6.2 were recorded in M0 from an executed Colab T4 notebook (`results/kmeans_cuda_M0.ipynb`) |
 
 ### 20.1 Academic and code-style expectations for Stage 2
 
@@ -1228,3 +1234,4 @@ Optional items, including the cross-GPU comparison (OPT-006, PERF-012), are not 
 | 1.5 | 2026-10-17 | DEC-011 amended: source kept in `src/`, notebook generated by `tools/build_notebook.py`. New DEC-012: GitHub (`sureshbabugandla/gpu-programming`, folder `GPU-Based-K-Means-Clustering/`) + Colab workflow with executed notebooks saved to `results/` as evidence. Repository layout §15.2a added. No change to algorithmic semantics. | Student |
 | 1.6 | 2026-10-17 | Project folder renamed to `GPU-Based-K-Means-Clustering` (no spaces, so paths need no quoting in shell cells, GitHub or Colab). | Student |
 | 1.7 | 2026-10-17 | M0 decisions recorded. **BLD-001c** (old text: "Benchmark CSVs, outputs and the notebook MUST be saved to Google Drive (mounted in the notebook) so a runtime disconnect does not lose results."): Drive persistence is now conditional — results MUST be saved to Drive when `USE_DRIVE` is enabled and the mount succeeds; otherwise the notebook warns, falls back to `/content/kmeans` and records the fallback in the environment record. Reason: `drive.mount()` requires an interactive authorisation click, which contradicts the manual-step-free "restart and run all" of NFR-014/DEC-011; the fallback resolves the conflict and keeps unpersisted results identifiable. **§15.2a**: `tools/cells/` added to the layout (markdown and Python cell content embedded verbatim by the generator, keeping `build_notebook.py` to manifest and assembly logic only); `tests/` comment extended to name the toolchain smoke test. **§15.3**: new cell part 4, the toolchain smoke test (`hello.cu` compiled with the recorded `SM_ARCH` and run, printing device name, compute capability, SM count, reported CUDA runtime version and a kernel-written value, raising on any failure); former parts 4–11 renumbered 5–12. Reason: validate `SM_ARCH`, toolkit and kernel launch before any program source is compiled, so a toolchain fault is diagnosed in one small cell instead of a multi-file build. Test impact: no test IDs added, changed or withdrawn; part 4 is covered by TEST-B01 (clean run-all) and exercises CUDA-001/CUDA-008 reporting paths. No change to algorithmic semantics. | Student |
+| 1.8 | 2026-10-17 | Environment recorded, closing the last Stage 1 gate item. **§1.6.2** retitled from "Open items (record from the student's machine before Stage 2)" to "Recorded environment": the "How to record / Default assumed" columns are replaced by the values measured in the M0 Colab session (Tesla T4, CC 7.5, 40 SMs, 48 KiB/64 KiB opt-in shared memory, 15 GB, driver 580.82.07; CUDA 13.0 V13.0.88; Ubuntu 24.04.4 with g++ 13.3.0; compute-sanitizer, Nsight Systems 2025.3.1.0 and Nsight Compute present) plus each value's consequence for the implementation. ENV-06 is cited, not measured: FP32 8.1 TFLOPS and 300 GB/sec from the NVIDIA T4 datasheet (MAR19), which lists no FP64 figure, and FP64:FP32 = 1:32 from NVIDIA's Turing architecture documentation (two FP64 units per SM), with both URLs recorded; the derived ≈ 0.25 TFLOPS FP64 is labelled as derived. Evidence for every measured value: `results/kmeans_cuda_M0.ipynb`. **§18.1** final gate item ticked; the header Status line, the §1.6 preamble and the §20 "Remaining open points" row updated to match. Reason: ENV-01..ENV-03 and ENV-08 were pending facts about the machine, and §18.1 required them before kernels are written; the FP64 rate is needed to interpret §13 because both strategies accumulate in binary64 (DEC-007), which is why OPT-002 exists. Test impact: none; no requirement text outside §1.6.2 changed, and no test IDs were added, changed or withdrawn. No change to algorithmic semantics. | Student |

@@ -3,6 +3,7 @@
 # assumes a GPU model, a toolkit version or a driver version; the reported strings are the record.
 import json
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -20,14 +21,29 @@ def _run(cmd, timeout=120):
     return p.returncode == 0, out
 
 
-def _first_line(text):
-    return text.splitlines()[0].strip() if text else ""
+_VERSION_RE = re.compile(r"[0-9]+[.][0-9]+")
 
 
 def _version_of(cmd):
-    """Version string of a tool invoked as `<tool> --version`, or None."""
+    """Version line of a tool invoked as `<tool> --version`, or None.
+
+    compute-sanitizer and ncu print the product name on the first line and the version several
+    lines later, so taking the first line alone recorded no version at all for them (ENV-02,
+    ENV-08). Prefer the first line that carries a version number, keeping the product name with
+    it, and fall back to the first line when no line has one.
+    """
     ok, out = _run([cmd, "--version"])
-    return _first_line(out) if ok else None
+    if not ok:
+        return None
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    if not lines:
+        return None
+    if _VERSION_RE.search(lines[0]):
+        return lines[0]
+    for line in lines[1:]:
+        if _VERSION_RE.search(line) and "opyright" not in line:
+            return f"{lines[0]} {line}"
+    return lines[0]
 
 
 ENV = {}

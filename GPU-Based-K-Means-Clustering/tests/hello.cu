@@ -55,7 +55,7 @@ int main()
     std::printf("device.sm_count=%d\n", prop.multiProcessorCount);
     std::printf("device.global_mem_bytes=%zu\n", prop.totalGlobalMem);
     std::printf("device.shared_mem_per_block_bytes=%zu\n", prop.sharedMemPerBlock);
-    std::printf("device.shared_mem_per_block_optin_bytes=%d\n", prop.sharedMemPerBlockOptin);
+    std::printf("device.shared_mem_per_block_optin_bytes=%zu\n", prop.sharedMemPerBlockOptin);
     std::printf("device.warp_size=%d\n", prop.warpSize);
     std::printf("device.max_threads_per_block=%d\n", prop.maxThreadsPerBlock);
     std::printf("runtime.cuda_version=%d\n", runtime_version);
