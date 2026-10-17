@@ -1,0 +1,19 @@
+# The notebook is a build output whose source cells must stay byte-identical to the
+# repository files (DEC-011), and build_notebook.py --check compares bytes. The repository
+# is cloned on Windows with core.autocrlf=true, so text files are pinned to LF here;
+# otherwise a fresh checkout would differ from a freshly generated notebook.
+* text=auto eol=lf
+
+*.ipynb text eol=lf
+*.py    text eol=lf
+*.cu    text eol=lf
+*.cuh   text eol=lf
+*.cpp   text eol=lf
+*.h     text eol=lf
+*.md    text eol=lf
+*.csv   text eol=lf
+*.json  text eol=lf
+
+# Binary dataset and output formats (BLD-004)
+*.kmd binary
+*.kma binary

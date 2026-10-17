@@ -5,7 +5,7 @@
 | Document type | Software Requirements Specification (Specification-Driven Development) |
 | Project | Problem 5: GPU-Based K-Means Clustering |
 | Stage | Stage 1 — Specification (no implementation code) |
-| Version | 1.6 |
+| Version | 1.7 |
 | Status | Specification complete; Stage 2 may begin once machine-dependent items in §1.6.2 are recorded |
 | Normative keywords | **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, **MAY** as in RFC 2119 |
 
@@ -920,7 +920,7 @@ Interface contract (illustrative, not code to be copied): the driver exposes one
 
 Jupyter MUST be started from the "x64 Native Tools Command Prompt for VS 2022" so `cl.exe` is on `PATH` for `nvcc`; alternatively the notebook passes `-ccbin` with the full path to `cl.exe`.
 
-**BLD-001c — Prerequisites, Google Colab runtime** — MUST (selected runtime). Runtime type set to a GPU; `nvcc`, the driver and Python packages are preinstalled. Profilers may be absent or restricted; ENV-08 fallback applies. The notebook records the assigned GPU, because Colab may assign different GPUs across sessions; all benchmark rows of one evaluation MUST come from one GPU model and SHOULD come from one session. Benchmark CSVs, outputs and the notebook MUST be saved to Google Drive (mounted in the notebook) so a runtime disconnect does not lose results. `SM_ARCH` is set from the recorded compute capability (e.g. `sm_75` for a Tesla T4), never hard-coded before ENV-01 is recorded.
+**BLD-001c — Prerequisites, Google Colab runtime** — MUST (selected runtime). Runtime type set to a GPU; `nvcc`, the driver and Python packages are preinstalled. Profilers may be absent or restricted; ENV-08 fallback applies. The notebook records the assigned GPU, because Colab may assign different GPUs across sessions; all benchmark rows of one evaluation MUST come from one GPU model and SHOULD come from one session. Benchmark CSVs, outputs and the notebook MUST be saved to Google Drive (mounted in the notebook) when `USE_DRIVE` is enabled and the mount succeeds, so a runtime disconnect does not lose results; if `USE_DRIVE` is disabled or the mount fails, the notebook MUST emit a warning, fall back to `/content/kmeans`, and record the fallback in the environment record so results that were not persisted are identifiable. The fallback keeps "restart kernel and run all" free of manual steps (NFR-014, DEC-011). `SM_ARCH` is set from the recorded compute capability (e.g. `sm_75` for a Tesla T4), never hard-coded before ENV-01 is recorded.
 
 ### 15.2 Compilation
 
@@ -934,8 +934,10 @@ gpu-programming/
     ├── requirements.md        # this specification
     ├── CLAUDE.md              # rules for the coding assistant
     ├── src/                   # common.h, kmeans.cu, cpu_reference.cpp, gen.cpp, ...
-    ├── tests/                 # test drivers and hand datasets H1–H6
-    ├── tools/build_notebook.py
+    ├── tests/                 # test drivers, toolchain smoke test, hand datasets H1–H6
+    ├── tools/
+    │   ├── build_notebook.py  # notebook generator (DEC-011); holds the §15.3 cell manifest
+    │   └── cells/             # markdown and Python cell content embedded verbatim by the generator
     ├── kmeans_cuda.ipynb      # generated; final deliverable
     └── results/               # executed notebooks and CSVs saved from Colab
 ```
@@ -947,14 +949,15 @@ gpu-programming/
 1. Title, problem statement, summary of design decisions (§3.1).
 2. Environment cell: OS detection, `nvidia-smi`, `nvcc --version`, host compiler version, GPU properties; result stored and printed (ENV record, PERF-008).
 3. Configuration cell: Google Drive mount, `SM_ARCH` derived from ENV-01, paths.
-4. Source cells (`%%writefile`): common header, CPU reference, kernels, host driver, dataset generator, test driver.
-5. Compile cell(s).
-6. Hand-dataset demonstration (H1–H6) with outputs shown.
-7. Test suite cell (TEST-B02).
-8. Sanitizer cells (TEST-S01–S04).
-9. Benchmark cell(s) writing CSVs (§13.1).
-10. Analysis cells: tables and plots of time vs. N, D, K for both strategies and both assignment kernels; numerical comparison tables.
-11. Written evaluation and limitations.
+4. Toolchain smoke test: a minimal `hello.cu` written by `%%writefile`, compiled with `nvcc -arch=$SM_ARCH`, and run; it prints the device name, compute capability, SM count and the reported CUDA runtime version from host code (CUDA-001) together with a value written by a kernel, proving the recorded `SM_ARCH`, the toolkit and kernel launch all work before any program source is compiled. The cell MUST raise on a non-zero compile or run exit code, or on an unexpected kernel result, so "restart kernel and run all" stops at the first toolchain fault (NFR-014, CUDA-008). No CUDA or driver version is assumed; whatever `nvcc` and the runtime report is printed.
+5. Source cells (`%%writefile`): common header, CPU reference, kernels, host driver, dataset generator, test driver.
+6. Compile cell(s).
+7. Hand-dataset demonstration (H1–H6) with outputs shown.
+8. Test suite cell (TEST-B02).
+9. Sanitizer cells (TEST-S01–S04).
+10. Benchmark cell(s) writing CSVs (§13.1).
+11. Analysis cells: tables and plots of time vs. N, D, K for both strategies and both assignment kernels; numerical comparison tables.
+12. Written evaluation and limitations.
 
 The executables keep the CLI of BLD-003a so that the same commands work from a notebook cell and a terminal.
 
@@ -1224,3 +1227,4 @@ Optional items, including the cross-GPU comparison (OPT-006, PERF-012), are not 
 | 1.4 | 2026-10-17 | Added optional cross-GPU comparison (OPT-006, PERF-012, TEST-P05): T4 primary with full matrix, one secondary Colab GPU (A100 preferred) with reduced matrix, identical conditions, per-GPU CSVs. Not part of Definition of Done. | Student |
 | 1.5 | 2026-10-17 | DEC-011 amended: source kept in `src/`, notebook generated by `tools/build_notebook.py`. New DEC-012: GitHub (`sureshbabugandla/gpu-programming`, folder `GPU-Based-K-Means-Clustering/`) + Colab workflow with executed notebooks saved to `results/` as evidence. Repository layout §15.2a added. No change to algorithmic semantics. | Student |
 | 1.6 | 2026-10-17 | Project folder renamed to `GPU-Based-K-Means-Clustering` (no spaces, so paths need no quoting in shell cells, GitHub or Colab). | Student |
+| 1.7 | 2026-10-17 | M0 decisions recorded. **BLD-001c** (old text: "Benchmark CSVs, outputs and the notebook MUST be saved to Google Drive (mounted in the notebook) so a runtime disconnect does not lose results."): Drive persistence is now conditional — results MUST be saved to Drive when `USE_DRIVE` is enabled and the mount succeeds; otherwise the notebook warns, falls back to `/content/kmeans` and records the fallback in the environment record. Reason: `drive.mount()` requires an interactive authorisation click, which contradicts the manual-step-free "restart and run all" of NFR-014/DEC-011; the fallback resolves the conflict and keeps unpersisted results identifiable. **§15.2a**: `tools/cells/` added to the layout (markdown and Python cell content embedded verbatim by the generator, keeping `build_notebook.py` to manifest and assembly logic only); `tests/` comment extended to name the toolchain smoke test. **§15.3**: new cell part 4, the toolchain smoke test (`hello.cu` compiled with the recorded `SM_ARCH` and run, printing device name, compute capability, SM count, reported CUDA runtime version and a kernel-written value, raising on any failure); former parts 4–11 renumbered 5–12. Reason: validate `SM_ARCH`, toolkit and kernel launch before any program source is compiled, so a toolchain fault is diagnosed in one small cell instead of a multi-file build. Test impact: no test IDs added, changed or withdrawn; part 4 is covered by TEST-B01 (clean run-all) and exercises CUDA-001/CUDA-008 reporting paths. No change to algorithmic semantics. | Student |
