@@ -1,5 +1,5 @@
 // test_gpu.cu — GPU test driver for milestones M2 (baseline assign, Approach A, update,
-// convergence, finalization) and M3 (Approach B).
+// convergence, finalization), M3 (Approach B) and M4 (assign_smem).
 //
 // Covers, for both accumulation strategies:
 //   TEST-I01 / TEST-I02   H1-H6 and H2-a..e against the expected results of section 16.0
@@ -15,10 +15,13 @@
 //   TEST-U07              partial Stage 2 tiles: K = 1024, D in {1, 33, 65}, small chunks
 //   TEST-U08 / U10        movement and update, from the lockstep snapshots
 //   TEST-E16 / EDGE-16    N, D, K not multiples of the block, tile or warp size
+//   SMEM-004              assign_smem produces bit-identical runs to the baseline assign on
+//                         every test dataset, and TEST-U01 in lockstep for the tiled kernel
 //
 // One executable, non-zero exit on any failure, so a single notebook cell can gate the run
-// (NFR-015). `--quick` runs only the subset the Batch A notebook cells need; the full run adds
-// the G sweep, the partial-tile cases and the non-aligned size sweep.
+// (NFR-015). `--quick` runs only the subset the development notebook cells need; the full run
+// adds the G sweep, the partial-tile cases, the non-aligned size sweep, the SMEM-004 size matrix
+// and the assign_smem lockstep run.
 //
 // No result here is evidence of anything until an executed notebook in results/ shows it
 // (CLAUDE.md): this file only defines what must hold.
@@ -90,6 +93,11 @@ public:
 const char *strategy_name(Strategy s)
 {
     return s == Strategy::kAtomic ? "atomic" : "reduction";
+}
+
+const char *assign_name(AssignKernel a)
+{
+    return a == AssignKernel::kBaseline ? "baseline" : "smem";
 }
 
 // Every GPU call path can raise CudaError (cuda_util.cuh). A test must record that as a failure
@@ -433,9 +441,10 @@ GenParams lockstep_params()
     return p;
 }
 
-void test_lockstep(Strategy strategy, const Dataset &data, const GenParams &params)
+void test_lockstep(Strategy strategy, AssignKernel assign, const Dataset &data,
+                   const GenParams &params)
 {
-    TestScope scope("I10", std::string(strategy_name(strategy)) +
+    TestScope scope("I10", std::string(strategy_name(strategy)) + " / " + assign_name(assign) +
                                "  lockstep vs. CPU reference on " +
                                std::to_string(params.N) + " x " + std::to_string(params.D) +
                                ", K=" + std::to_string(params.K) + " blobs (section 10.3)");
@@ -453,6 +462,7 @@ void test_lockstep(Strategy strategy, const Dataset &data, const GenParams &para
     // assignment stability and every iteration up to that point is lockstep-checked.
     options.config.tol = 0.0;
     options.config.strategy = strategy;
+    options.config.assign_kernel = assign;
     options.m_range = m_range;
     options.verify = gpu::Verify::kLockstep;
 
@@ -468,7 +478,7 @@ void test_lockstep(Strategy strategy, const Dataset &data, const GenParams &para
         return;
     }
 
-    report_lockstep(stats, std::string(strategy_name(strategy)));
+    report_lockstep(stats, std::string(strategy_name(strategy)) + "/" + assign_name(assign));
     check(!info.timing_valid,
           "a lockstep run is marked as not timing-valid (FR-019: never a benchmark sample)");
     if (strategy == Strategy::kReduction) {
@@ -823,6 +833,242 @@ void test_non_aligned(Strategy strategy)
     std::printf("      %lld configurations run\n", static_cast<long long>(configurations));
 }
 
+// --- SMEM-004: assign_smem must agree with the baseline exactly ---------------------------------
+//
+// Both kernels accumulate the same binary32 terms in the same ascending-j order and compare
+// candidates in the same ascending-k order with the same strict-less-than rule, so the computed
+// distances are bit-identical and the whole run must be too -- assignments, counts, centroids,
+// iteration count, status and Delta. That is a stronger statement than "within NUM-006", and it
+// is the one SMEM-004 asks for when both kernels are compiled with the same FMA settings. A
+// difference would mean the tiled kernel reordered arithmetic (NUM-002) or that ptxas contracted
+// a multiply-add in one kernel and not the other, which SMEM-004 requires to be explained.
+
+// Bitwise comparison, so a one-ulp centroid difference is a failure rather than a tolerance hit.
+bool results_identical(const Result &a, const Result &b, std::string *why)
+{
+    if (a.status != b.status) {
+        *why = std::string("status ") + status_name(a.status) + " vs " + status_name(b.status);
+        return false;
+    }
+    if (a.iterations != b.iterations) {
+        *why = "iterations " + std::to_string(a.iterations) + " vs " + std::to_string(b.iterations);
+        return false;
+    }
+    if (a.centroid_consistent != b.centroid_consistent) {
+        *why = "the P2 flag differs";
+        return false;
+    }
+    if (a.has_last_delta != b.has_last_delta ||
+        std::memcmp(&a.last_delta, &b.last_delta, sizeof(double)) != 0) {
+        *why = "Delta " + double_str(a.last_delta) + " vs " + double_str(b.last_delta);
+        return false;
+    }
+    if (a.assignments.size() != b.assignments.size() || a.counts.size() != b.counts.size() ||
+        a.centroids.size() != b.centroids.size()) {
+        *why = "result array sizes differ";
+        return false;
+    }
+    for (size_t i = 0; i < a.assignments.size(); ++i) {
+        if (a.assignments[i] != b.assignments[i]) {
+            *why = "assignment of point " + std::to_string(i) + ": " +
+                   std::to_string(a.assignments[i]) + " vs " + std::to_string(b.assignments[i]);
+            return false;
+        }
+    }
+    for (size_t k = 0; k < a.counts.size(); ++k) {
+        if (a.counts[k] != b.counts[k]) {
+            *why = "count of cluster " + std::to_string(k) + ": " + std::to_string(a.counts[k]) +
+                   " vs " + std::to_string(b.counts[k]);
+            return false;
+        }
+    }
+    for (size_t e = 0; e < a.centroids.size(); ++e) {
+        // Bitwise: -0.0 and 0.0 would compare equal with ==, and the kernels must not even
+        // differ in the sign of a zero.
+        if (std::memcmp(&a.centroids[e], &b.centroids[e], sizeof(float)) != 0) {
+            *why = "centroid element " + std::to_string(e) + ": " + float_str(a.centroids[e]) +
+                   " vs " + float_str(b.centroids[e]);
+            return false;
+        }
+    }
+    return true;
+}
+
+// One (dataset, parameters) pair run with both assign kernels and compared. Returns false when
+// either run failed on the device, so the caller can keep counting configurations honestly.
+bool compare_assign_kernels(const float *X, const float *C0, const Config &base, double m_range,
+                            const std::string &tag)
+{
+    gpu::Options options;
+    options.config = base;
+    options.m_range = m_range;
+
+    Result baseline;
+    gpu::RunInfo info;
+    options.config.assign_kernel = AssignKernel::kBaseline;
+    if (!run_device(X, C0, options, &baseline, &info, gpu::LockstepHook(), tag + " baseline")) {
+        return false;
+    }
+
+    Result smem;
+    options.config.assign_kernel = AssignKernel::kSharedMemory;
+    if (!run_device(X, C0, options, &smem, &info, gpu::LockstepHook(), tag + " smem")) {
+        return false;
+    }
+
+    std::string why;
+    check(results_identical(baseline, smem, &why),
+          tag + ": assign_smem differs from assign (" + why + ")");
+    return true;
+}
+
+// H1-H6 and H2-a..e: tiny, hand-derived, and every one of them has K <= 3 and D <= 2, so they
+// exercise the partial-tile paths of the loader -- T_K = 8 and T_D = 32 both overhang.
+void test_smem_hand_cases(Strategy strategy)
+{
+    for (const tests::HandCase &c : tests::hand_cases()) {
+        TestScope scope("SMEM-004", std::string(strategy_name(strategy)) + "  " + c.id +
+                                        (c.note.empty() ? "" : "  (" + c.note + ")"));
+        double m_range = 0.0;
+        const Validation v = validate_data(c.X, c.N, c.D, c.C0, c.K, &m_range);
+        check(v.ok, c.id + ": the hand dataset is valid");
+        if (!v.ok) {
+            continue;
+        }
+
+        Config config;
+        config.N = c.N;
+        config.D = c.D;
+        config.K = c.K;
+        config.max_iter = c.max_iter;
+        config.tol = c.tol;
+        config.strategy = strategy;
+        compare_assign_kernels(c.X.data(), c.C0.data(), config, m_range, c.id);
+    }
+}
+
+// Blob datasets. The sizes are chosen around the tile geometry rather than around the warp: D
+// below, at and above T_D = 32, K below, at and above T_K = 8, and N that is not a multiple of
+// the block size so the final block is partial (SMEM-002, EDGE-17).
+void test_smem_datasets(bool quick)
+{
+    struct Case {
+        int64_t N, D, K;
+        const char *why;
+    };
+    const Case quick_cases[] = {
+        {1, 1, 1, "N = D = K = 1: one partial tile in both directions"},
+        {257, 33, 7, "D and K just over one tile, partial final block"},
+        {1023, 32, 8, "D and K exactly one tile"},
+        {4096, 65, 9, "three dimension tiles, two centroid tiles, both overhanging"},
+    };
+    const Case full_cases[] = {
+        {50000, 128, 100, "many tiles in both directions (13 k-tiles x 4 j-tiles)"},
+        {10000, 512, 64, "D = 512: 16 dimension tiles per centroid tile"},
+        {10000, 2, 1024, "K = 1024 with D below one dimension tile"},
+    };
+
+    const Strategy strategies[] = {Strategy::kAtomic, Strategy::kReduction};
+    int64_t configurations = 0;
+
+    auto run_case = [&](const Case &c) {
+        GenParams p;
+        p.N = c.N;
+        p.D = c.D;
+        p.K = c.K;
+        // Section 10.3 method 2: far above 10 sigma, so the two kernels cannot be let off the
+        // hook by a near-tie that happens to fall the same way in both.
+        p.sep = 50.0;
+        p.spread = 0.1;
+        p.seed = 4000 + static_cast<uint64_t>(c.N * 1000 + c.D * 10 + c.K);
+        const Dataset data = generate(p);
+
+        double m_range = 0.0;
+        const Validation v = validate_data(data.X, c.N, c.D, data.C0, c.K, &m_range);
+        if (!v.ok) {
+            check(false, std::string(c.why) + ": generated data rejected: " + v.message);
+            return;
+        }
+
+        for (Strategy strategy : strategies) {
+            TestScope scope("SMEM-004", std::string(strategy_name(strategy)) + "  N=" +
+                                            std::to_string(c.N) + " D=" + std::to_string(c.D) +
+                                            " K=" + std::to_string(c.K) + "  " + c.why);
+            Config config;
+            config.N = c.N;
+            config.D = c.D;
+            config.K = c.K;
+            config.max_iter = 15;
+            config.tol = 0.0;
+            config.strategy = strategy;
+            if (compare_assign_kernels(data.X.data(), data.C0.data(), config, m_range,
+                                       std::string(c.why))) {
+                ++configurations;
+            }
+        }
+    };
+
+    for (const Case &c : quick_cases) {
+        run_case(c);
+    }
+    if (!quick) {
+        for (const Case &c : full_cases) {
+            run_case(c);
+        }
+    }
+    std::printf("      %lld configurations compared kernel against kernel\n",
+                static_cast<long long>(configurations));
+}
+
+// The TEST-E16 size matrix, run through both assign kernels. This is the "all test datasets" part
+// of SMEM-004: the non-aligned sweep is where a tile loader that mishandles an overhang shows up.
+void test_smem_non_aligned()
+{
+    const int64_t n_values[] = {1, 31, 33, 255, 257, 1023};
+    const int64_t d_values[] = {1, 3, 31, 33, 65};
+    const int64_t k_values[] = {1, 3, 7, 9, 17};
+
+    TestScope scope("SMEM-004", "assign vs. assign_smem over the TEST-E16 size matrix");
+    int64_t configurations = 0;
+    for (int64_t N : n_values) {
+        for (int64_t D : d_values) {
+            for (int64_t K : k_values) {
+                GenParams p;
+                p.N = N;
+                p.D = D;
+                p.K = K;
+                p.sep = 50.0;
+                p.spread = 0.1;
+                // The same seeds as test_non_aligned, so the two tests see the same datasets.
+                p.seed = 1600 + static_cast<uint64_t>(N * 1000 + D * 10 + K);
+                const Dataset data = generate(p);
+
+                double m_range = 0.0;
+                const Validation v = validate_data(data.X, N, D, data.C0, K, &m_range);
+                if (!v.ok) {
+                    check(false, "generated data rejected: " + v.message);
+                    continue;
+                }
+
+                Config config;
+                config.N = N;
+                config.D = D;
+                config.K = K;
+                config.max_iter = 25;
+                config.tol = 0.0;
+                config.strategy = Strategy::kReduction;  // the deterministic one (RED-009)
+                if (compare_assign_kernels(data.X.data(), data.C0.data(), config, m_range,
+                                           "N=" + std::to_string(N) + " D=" + std::to_string(D) +
+                                               " K=" + std::to_string(K))) {
+                    ++configurations;
+                }
+            }
+        }
+    }
+    std::printf("      %lld configurations compared kernel against kernel\n",
+                static_cast<long long>(configurations));
+}
+
 }  // namespace
 
 int main(int argc, char **argv)
@@ -833,29 +1079,36 @@ int main(int argc, char **argv)
     bool quick = false;
     bool run_hand = true;
     bool run_kernels = true;
+    bool run_smem = true;
+    const char *selection = "all sections";
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--quick") == 0) {
             quick = true;
         } else if (std::strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
             const char *what = argv[++i];
             if (std::strcmp(what, "hand") == 0) {
-                run_kernels = false;
+                run_kernels = run_smem = false;
+                selection = "hand cases only";
             } else if (std::strcmp(what, "kernels") == 0) {
-                run_hand = false;
+                run_hand = run_smem = false;
+                selection = "kernel checks only";
+            } else if (std::strcmp(what, "smem") == 0) {
+                run_hand = run_kernels = false;
+                selection = "shared-memory assignment only";
             } else if (std::strcmp(what, "all") != 0) {
-                std::fprintf(stderr, "error[VAL-010]: --only expects hand, kernels or all\n");
+                std::fprintf(stderr,
+                             "error[VAL-010]: --only expects hand, kernels, smem or all\n");
                 return kExitInvalidInput;
             }
         } else {
-            std::fprintf(stderr, "usage: test_gpu [--only {all|hand|kernels}] [--quick]\n");
+            std::fprintf(stderr,
+                         "usage: test_gpu [--only {all|hand|kernels|smem}] [--quick]\n");
             return kExitInvalidInput;
         }
     }
 
-    std::printf("M2-M3 GPU test suite (%s%s)\n", quick ? "quick" : "full",
-                run_hand && run_kernels ? "" : (run_hand ? ", hand cases only"
-                                                         : ", kernel checks only"));
-    std::printf("requirements.md sections 6, 7, 16.0, 16.1, 16.2, 10.3\n\n");
+    std::printf("M2-M4 GPU test suite (%s, %s)\n", quick ? "quick" : "full", selection);
+    std::printf("requirements.md sections 6, 7, 8, 16.0, 16.1, 16.2, 10.3\n\n");
 
     // The device is reported once, from the same query path the driver uses (CUDA-001).
     try {
@@ -892,7 +1145,7 @@ int main(int argc, char **argv)
                         data.dataset_id.c_str(), data.min_centre_distance,
                         data.spread > 0.0 ? data.min_centre_distance / data.spread : 0.0);
             for (Strategy strategy : strategies) {
-                test_lockstep(strategy, data, params);
+                test_lockstep(strategy, AssignKernel::kBaseline, data, params);
             }
         }
 
@@ -910,6 +1163,33 @@ int main(int argc, char **argv)
         } else {
             std::printf("\nskipped in --quick: TEST-U05 (G sweep), TEST-U07 (partial tiles), "
                         "TEST-E16 (non-aligned sizes)\n");
+        }
+    }
+
+    if (run_smem) {
+        std::printf("\nSMEM-004: assign_smem against the baseline, T_K = %d, T_D = %d, "
+                    "%lld B of shared memory per block (section 8)\n",
+                    kAssignTileK, kAssignTileD,
+                    static_cast<long long>(assign_smem_shared_bytes(kAssignTileK, kAssignTileD,
+                                                                    Config().block_size)));
+        for (Strategy strategy : strategies) {
+            test_smem_hand_cases(strategy);
+        }
+        test_smem_datasets(quick);
+
+        if (!quick) {
+            test_smem_non_aligned();
+
+            std::printf("\nTEST-U01 / section 10.3: assign_smem in lockstep against the CPU "
+                        "reference\n");
+            const GenParams params = lockstep_params();
+            const Dataset data = generate(params);
+            for (Strategy strategy : strategies) {
+                test_lockstep(strategy, AssignKernel::kSharedMemory, data, params);
+            }
+        } else {
+            std::printf("\nskipped in --quick: the SMEM-004 size matrix and the assign_smem "
+                        "lockstep run\n");
         }
     }
 

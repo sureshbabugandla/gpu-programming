@@ -70,13 +70,6 @@ Result run(const float *X, const float *C0, const Options &options, RunInfo *inf
     const int64_t D = cfg.D;
     const int64_t K = cfg.K;
 
-    if (cfg.assign_kernel == AssignKernel::kSharedMemory) {
-        // SMEM-004 requires the baseline to pass first; assign_smem arrives in M4.
-        throw CudaError("[SMEM-001] the shared-memory assignment kernel is not implemented yet "
-                        "(milestone M4); use --assign baseline",
-                        kExitInvalidInput);
-    }
-
     RunInfo local_info;
     RunInfo &out = (info != nullptr) ? *info : local_info;
 
@@ -160,6 +153,21 @@ Result run(const float *X, const float *C0, const Options &options, RunInfo *inf
     ConvergenceScalars *scalars = dev.scalars.get();
     ConvergenceScalars *host_scalars = dev.host_scalars.get();
 
+    // One assignment pass with the kernel selected by SMEM-004. The two kernels have the same
+    // contract -- same assignments, same change count, in-place write -- so the choice is confined
+    // to this lambda and no caller downstream can tell which ran.
+    const bool use_smem = cfg.assign_kernel == AssignKernel::kSharedMemory;
+    auto assign_pass = [&](const float *centroids, bool count_changes) {
+        if (use_smem) {
+            launch_assign_smem(dev.x_col.get(), N, D, centroids, K, dev.assignments.get(),
+                               &scalars->changed, count_changes, block, sm_count,
+                               dev.stream.get());
+        } else {
+            launch_assign(dev.x_col.get(), N, D, centroids, K, dev.assignments.get(),
+                          &scalars->changed, count_changes, block, sm_count, dev.stream.get());
+        }
+    };
+
     // One accumulation pass with the strategy selected by FR-018. Only this lambda differs
     // between Approach A and Approach B.
     auto accumulate = [&]() {
@@ -187,8 +195,7 @@ Result run(const float *X, const float *C0, const Options &options, RunInfo *inf
     alg_start.record(dev.stream.get());
 
     // The initial assignment pass has no previous assignment, so it counts no changes.
-    launch_assign(dev.x_col.get(), N, D, c_cur, K, dev.assignments.get(), &scalars->changed, false,
-                  block, sm_count, dev.stream.get());
+    assign_pass(c_cur, false);
 
     int64_t t = 0;
     Status status = Status::ITERATION_LIMIT;
@@ -232,8 +239,7 @@ Result run(const float *X, const float *C0, const Options &options, RunInfo *inf
                                           dev.stream.get()));
         // c_next holds C(t+1): the pointer swap below is bookkeeping, so the assignment pass of
         // iteration t reads the buffer the update just wrote.
-        launch_assign(dev.x_col.get(), N, D, c_next, K, dev.assignments.get(), &scalars->changed,
-                      true, block, sm_count, dev.stream.get());
+        assign_pass(c_next, true);
 
         // CUDA-011: the only in-loop transfer, 16 bytes into pinned host memory.
         KMEANS_CUDA_CHECK(cudaMemcpyAsync(host_scalars, scalars, sizeof(ConvergenceScalars),

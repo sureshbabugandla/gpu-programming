@@ -64,12 +64,23 @@ inline int64_t stage2_tiles(int64_t K, int64_t D)
     return K * stage2_dim_tiles(D);
 }
 
-// --- SMEM-001 / SMEM-003 assign_smem tile defaults ---------------------------------------------
-// Declared here so the startup capacity check and VAL-010 can see them before M4 implements the
-// kernel; shared memory per block is 4 * T_K * T_D bytes (1 KiB at the defaults).
-constexpr int kAssignTileK = 8;
-constexpr int kAssignTileD = 32;
+// --- SMEM-001 / SMEM-003 assign_smem tile geometry ---------------------------------------------
+// SMEM-001 makes T_K and T_D compile-time constants with alternatives configurable at build, so
+// they are macros with the specified defaults and the PERF-003 tile sweep recompiles with
+// -DKMEANS_TILE_K / -DKMEANS_TILE_D rather than passing a runtime option. Keeping them
+// compile-time is what lets the kernel hold its T_K partial distances in registers: the array is
+// indexed only by fully unrolled loop counters.
+#ifndef KMEANS_TILE_K
+#define KMEANS_TILE_K 8
+#endif
+#ifndef KMEANS_TILE_D
+#define KMEANS_TILE_D 32
+#endif
 
+constexpr int kAssignTileK = KMEANS_TILE_K;
+constexpr int kAssignTileD = KMEANS_TILE_D;
+
+// SMEM-003: the centroid tile itself, 4 T_K T_D bytes (1 KiB at the defaults).
 inline int64_t assign_smem_bytes(int tile_k, int tile_d)
 {
     return 4 * static_cast<int64_t>(tile_k) * static_cast<int64_t>(tile_d);
@@ -82,6 +93,18 @@ inline int64_t assign_smem_bytes(int tile_k, int tile_d)
 inline int64_t block_reduction_bytes(int block)
 {
     return 8 * static_cast<int64_t>(block);
+}
+
+// `assign_smem` needs the centroid tile of SMEM-003 and, because it has the same change-counting
+// contract as the baseline (CUDA-002), the per-block reduction of MEM-004 as well: 4 T_K T_D +
+// 8 * block size bytes in one dynamic allocation, 3 KiB at the defaults with a 256-thread block.
+// The two regions are disjoint rather than overlaid; the kilobyte saved by reusing the tile for
+// the reduction buys no occupancy at any block size this project uses, and disjoint regions mean
+// the barrier structure alone does not have to carry the argument that nothing is reading the
+// tile when the reduction starts writing.
+inline int64_t assign_smem_shared_bytes(int tile_k, int tile_d, int block)
+{
+    return assign_smem_bytes(tile_k, tile_d) + block_reduction_bytes(block);
 }
 
 // `reduce_stage2`: 8 * 32 binary64 sums plus 8 uint32 counts = 2080 B, independent of the launch.

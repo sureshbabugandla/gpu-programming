@@ -36,6 +36,13 @@ void launch_assign(const float *x_col, int64_t N, int64_t D, const float *centro
                    int32_t *assignments, unsigned long long *changed, bool count_changes,
                    int block, int sm_count, cudaStream_t stream);
 
+// Section 8, SMEM-001..SMEM-004: the same contract as launch_assign with the centroid tile staged
+// in shared memory. T_K and T_D are the compile-time constants of launch_config.h, so selecting
+// other tile sizes is a rebuild with -DKMEANS_TILE_K / -DKMEANS_TILE_D (SMEM-001).
+void launch_assign_smem(const float *x_col, int64_t N, int64_t D, const float *centroids,
+                        int64_t K, int32_t *assignments, unsigned long long *changed,
+                        bool count_changes, int block, int sm_count, cudaStream_t stream);
+
 // Section 6, ATOM-002..ATOM-004: one thread per element of X, grid-stride over N*D.
 void launch_accum_atomic(const float *x_col, int64_t N, int64_t D, const int32_t *assignments,
                          int64_t K, double *sums, unsigned int *counts, int block, int sm_count,

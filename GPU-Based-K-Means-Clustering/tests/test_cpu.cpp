@@ -764,12 +764,27 @@ void test_launch_geometry()
         const int64_t limit = 49152;
         check_eq_i64(stage2_shared_bytes(), 8 * 8 * 32 + 4 * 8, "reduce_stage2 needs 2080 B");
         check(stage2_shared_bytes() <= limit, "reduce_stage2 fits the 48 KiB limit");
-        check_eq_i64(assign_smem_bytes(kAssignTileK, kAssignTileD), 1024,
-                     "assign_smem needs 1 KiB at T_K = 8, T_D = 32");
+        check_eq_i64(assign_smem_bytes(8, 32), 1024,
+                     "assign_smem needs 1 KiB at the SMEM-001 defaults T_K = 8, T_D = 32");
+        // The tile sizes are compile-time (SMEM-001), so the configured build is checked against
+        // the formula rather than against the default literal: a -DKMEANS_TILE_K build must still
+        // satisfy SMEM-003.
+        check_eq_i64(assign_smem_bytes(kAssignTileK, kAssignTileD),
+                     4 * static_cast<int64_t>(kAssignTileK) * kAssignTileD,
+                     "the configured tile costs 4 T_K T_D bytes");
+        check(assign_smem_bytes(kAssignTileK, kAssignTileD) <= limit,
+              "the configured tile fits the 48 KiB limit");
         check(assign_smem_bytes(16, 32) <= limit, "the largest tile sweep configuration fits");
         check_eq_i64(block_reduction_bytes(1024), 8192,
                      "a 1024-thread block reduction needs 8 KiB");
         check(block_reduction_bytes(1024) <= limit, "the largest block reduction fits");
+        // assign_smem asks for the tile and the change-count reduction in one allocation.
+        check_eq_i64(assign_smem_shared_bytes(8, 32, 256), 1024 + 2048,
+                     "assign_smem needs 3 KiB at the defaults with a 256-thread block");
+        check_eq_i64(assign_smem_shared_bytes(16, 32, 1024), 2048 + 8192,
+                     "the largest tile with the largest block needs 10 KiB");
+        check(assign_smem_shared_bytes(kAssignTileK, kAssignTileD, 1024) <= limit,
+              "the configured tile plus the largest block reduction fits the 48 KiB limit");
     }
 
     {

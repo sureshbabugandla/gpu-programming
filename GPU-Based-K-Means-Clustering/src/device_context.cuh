@@ -119,6 +119,10 @@ inline void check_shared_memory(const DeviceInfo &info, int block_size, int tile
         {"MEM-004", "max_reduce final reduction", block_reduction_bytes(kMaxMovementBlocks)},
         {"MEM-004", "reduce_stage2 sums and counts", stage2_shared_bytes()},
         {"SMEM-003", "assign_smem centroid tile", assign_smem_bytes(tile_k, tile_d)},
+        // assign_smem asks for the tile and its change-count reduction in one allocation, so the
+        // sum is what the launch actually requests and what has to fit.
+        {"SMEM-003", "assign_smem tile and change-count reduction",
+         assign_smem_shared_bytes(tile_k, tile_d, block_size)},
     };
     for (const Request &r : requests) {
         if (r.bytes > limit) {

@@ -110,6 +110,152 @@ __global__ void assign_kernel(const float *__restrict__ x_col, int64_t N, int64_
     }
 }
 
+// --- Section 8: SMEM-001..SMEM-004, tiled assignment -------------------------------------------
+//
+// Same contract as assign_kernel -- same assignments, same change count, same in-place write --
+// with the centroid tile staged in shared memory instead of re-read from global memory by every
+// thread.
+//
+// Thread mapping   one thread per point i, 1-D grid-stride (DEC-008), as in the baseline. The
+//                  trip count of the grid-stride loop is derived from the block's first index and
+//                  is therefore uniform across the block: the tile loads and barriers inside the
+//                  loop are block-collective, so a per-thread trip count would deadlock
+//                  (SMEM-002, CUDA-005).
+// Ownership        thread i is the only reader and writer of assignments[i] (FR-007). The shared
+//                  tile is written cooperatively and read by every thread of the block; the two
+//                  are separated by barriers, so there is no shared-memory hazard (TEST-S02).
+// Synchronisation  per dimension tile: __syncthreads() after the cooperative load and again
+//                  after the last thread has consumed the tile, before it is overwritten
+//                  (SMEM-001 step 2). Threads with i >= N skip the arithmetic but perform the
+//                  loads and reach every barrier (SMEM-002).
+// Numerics         identical to the baseline, not merely equivalent: part[t] accumulates terms in
+//                  ascending j from 0 (within a tile by the jt loop, across tiles because j0
+//                  ascends), in binary32, never reordered (NUM-002). The comparison walks k in
+//                  ascending order and replaces the best candidate only on a strictly smaller
+//                  distance (DEC-005). The operation sequence is the same as assign_kernel's, so
+//                  the computed distances are bit-identical and SMEM-004 expects exactly equal
+//                  assignments under identical FMA settings.
+// Coalescing       x_col is dimension-major and the x value for one j is read once per thread per
+//                  tile (not once per centroid), so the centroid traffic that the baseline sends
+//                  through L1 for every (point, centroid) pair becomes one cooperative tile load
+//                  per block (SMEM-005). s_tile[t*T_D + jt] is uniform across a warp and
+//                  broadcasts, so the strided t index costs no bank conflicts.
+// Shared memory    4 T_K T_D B for the tile (SMEM-003) plus 8 B per thread for the change-count
+//                  reduction (MEM-004), both checked against the device limit at startup.
+template <int TK, int TD>
+__global__ void assign_smem_kernel(const float *__restrict__ x_col, int64_t N, int64_t D,
+                                   const float *__restrict__ centroids, int64_t K,
+                                   int32_t *__restrict__ assignments,
+                                   unsigned long long *__restrict__ changed, int count_changes)
+{
+    // One dynamic allocation holding two disjoint regions (launch_config.h
+    // assign_smem_shared_bytes): the T_K x T_D centroid tile first, then one 8-byte change-count
+    // slot per thread. Declaring the array as the 8-byte type gives the reduction its natural
+    // alignment, and T_D is validated as a multiple of the warp size (VAL-010), so the tile
+    // occupies a whole number of 8-byte words and the reduction region starts aligned.
+    static_assert(TD % 2 == 0, "T_D must be even so the centroid tile fills whole 8-byte words");
+    extern __shared__ unsigned long long s_raw[];
+    float *const s_tile = reinterpret_cast<float *>(s_raw);
+    unsigned long long *const s_changed = s_raw + (static_cast<unsigned>(TK) * TD) / 2;
+
+    const unsigned tid = threadIdx.x;
+    const unsigned block_dim = blockDim.x;
+    const uint64_t n = static_cast<uint64_t>(N);
+    const uint64_t base = static_cast<uint64_t>(blockIdx.x) * static_cast<uint64_t>(block_dim);
+    const uint64_t stride = grid_stride();
+    // Trip count for the thread of this block with the lowest index, which is the largest trip
+    // count in the block. Threads whose own index has already passed N run the remaining
+    // iterations with i >= N and are inactive in them.
+    const uint64_t trips = (base < n) ? ((n - base) + stride - 1) / stride : 0;
+
+    unsigned long long local_changed = 0;
+
+    for (uint64_t it = 0; it < trips; ++it) {
+        const uint64_t i = base + tid + it * stride;
+        const bool active = i < n;
+
+        float best = 0.0f;
+        int32_t best_k = 0;
+        bool have_best = false;
+
+        for (int64_t k0 = 0; k0 < K; k0 += TK) {
+            float part[TK];
+#pragma unroll
+            for (int t = 0; t < TK; ++t) {
+                part[t] = 0.0f;
+            }
+
+            for (int64_t j0 = 0; j0 < D; j0 += TD) {
+                // SMEM-001 step 2: the block loads C[k0:k0+TK][j0:j0+TD]. Out-of-range (k, j) are
+                // not read from global memory; their slots are zeroed so that nothing in shared
+                // memory is ever read uninitialised (MEM-006, initcheck), and the compute loops
+                // below skip them anyway.
+                for (unsigned e = tid; e < static_cast<unsigned>(TK) * TD; e += block_dim) {
+                    const int64_t kt = static_cast<int64_t>(e / TD);
+                    const int64_t jt = static_cast<int64_t>(e % TD);
+                    const int64_t k = k0 + kt;
+                    const int64_t j = j0 + jt;
+                    s_tile[e] = (k < K && j < D)
+                                    ? centroids[static_cast<uint64_t>(k) * static_cast<uint64_t>(D) +
+                                                static_cast<uint64_t>(j)]
+                                    : 0.0f;
+                }
+                __syncthreads();
+
+                if (active) {
+                    const int64_t jt_end = (D - j0 < TD) ? (D - j0) : TD;
+                    for (int64_t jt = 0; jt < jt_end; ++jt) {
+                        const float xv = x_col[static_cast<uint64_t>(j0 + jt) * n + i];
+                        // Unrolled over the compile-time T_K so part[] stays in registers
+                        // (CUDA-010): a dynamic index would place it in local memory.
+#pragma unroll
+                        for (int t = 0; t < TK; ++t) {
+                            if (k0 + t < K) {
+                                const float diff = xv - s_tile[t * TD + jt];
+                                part[t] += diff * diff;
+                            }
+                        }
+                    }
+                }
+                __syncthreads();  // before the next load overwrites the tile
+            }
+
+            // SMEM-001 step 3: ascending k, strict less-than, skipping k >= K. The first
+            // candidate k = 0 initialises the best (DEC-005).
+#pragma unroll
+            for (int t = 0; t < TK; ++t) {
+                if (k0 + t < K && (!have_best || part[t] < best)) {
+                    best = part[t];
+                    best_k = static_cast<int32_t>(k0 + t);
+                    have_best = true;
+                }
+            }
+        }
+
+        if (active) {
+            if (count_changes != 0 && assignments[i] != best_k) {
+                ++local_changed;
+            }
+            assignments[i] = best_k;
+        }
+    }
+
+    // CUDA-002: one 64-bit atomicAdd per block, as in the baseline. Threads whose grid-stride
+    // loop ran zero iterations reach these barriers too (CUDA-005); the trip count is uniform
+    // across the block, so no barrier here is reached by only part of it.
+    s_changed[tid] = local_changed;
+    __syncthreads();
+    for (unsigned s = reduction_start_stride(block_dim); s > 0; s >>= 1) {
+        if (tid < s && tid + s < block_dim) {
+            s_changed[tid] += s_changed[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0 && count_changes != 0) {
+        atomicAdd(changed, s_changed[0]);
+    }
+}
+
 // --- Section 6: Approach A, atomic accumulation ------------------------------------------------
 //
 // Thread mapping   one thread per element e of X, 1-D grid-stride over N*D, with
@@ -422,6 +568,19 @@ void launch_assign(const float *x_col, int64_t N, int64_t D, const float *centro
     assign_kernel<<<grid, block, shared, stream>>>(x_col, N, D, centroids, K, assignments, changed,
                                                    count_changes ? 1 : 0);
     KMEANS_CHECK_LAUNCH("assign");
+}
+
+void launch_assign_smem(const float *x_col, int64_t N, int64_t D, const float *centroids,
+                        int64_t K, int32_t *assignments, unsigned long long *changed,
+                        bool count_changes, int block, int sm_count, cudaStream_t stream)
+{
+    // Same grid as the baseline: the mapping is one thread per point either way (DEC-008).
+    const int grid = grid_size(N, block, sm_count);
+    const size_t shared =
+        static_cast<size_t>(assign_smem_shared_bytes(kAssignTileK, kAssignTileD, block));
+    assign_smem_kernel<kAssignTileK, kAssignTileD><<<grid, block, shared, stream>>>(
+        x_col, N, D, centroids, K, assignments, changed, count_changes ? 1 : 0);
+    KMEANS_CHECK_LAUNCH("assign_smem");
 }
 
 void launch_accum_atomic(const float *x_col, int64_t N, int64_t D, const int32_t *assignments,
