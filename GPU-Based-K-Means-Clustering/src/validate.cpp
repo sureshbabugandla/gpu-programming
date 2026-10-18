@@ -136,15 +136,21 @@ Validation validate_options(int block_size, int64_t reduce_chunks, int tile_k, i
                     kExitInvalidInput);
     }
 
-    // SMEM-001/SMEM-003: tile sizes positive, T_D a multiple of the warp size, 4 T_K T_D bytes of
-    // shared memory within the per-block limit (EDGE-34 rejects oversized configurations).
+    // SMEM-001/SMEM-003: tile sizes positive, T_D a multiple of 16, 4 T_K T_D bytes of shared
+    // memory within the per-block limit (EDGE-34 rejects oversized configurations).
     if (tile_k < 1 || tile_d < 1) {
         return fail("VAL-010", "tile sizes must be at least 1, got tile_k=" + istr(tile_k) +
                                    " tile_d=" + istr(tile_d),
                     kExitInvalidInput);
     }
-    if (tile_d % 32 != 0) {
-        return fail("VAL-010", "tile_d must be a multiple of the warp size 32, got " + istr(tile_d),
+    // A multiple of 16, not of 32: the documented range of T_D is the PERF-003 tile sweep,
+    // {16, 32}, and the kernel needs only an even T_D (its static_assert) so that the T_K x T_D
+    // tile fills whole 8-byte words and the change-count reduction after it starts aligned. 16
+    // floats is still exactly one 64-byte segment per tile row, which is the coalescing
+    // property the warp-multiple form of this rule was protecting; widths that are not a whole
+    // number of segments, such as 8 or 24, stay rejected.
+    if (tile_d % 16 != 0) {
+        return fail("VAL-010", "tile_d must be a multiple of 16, got " + istr(tile_d),
                     kExitInvalidInput);
     }
     uint64_t tile_bytes = 0;

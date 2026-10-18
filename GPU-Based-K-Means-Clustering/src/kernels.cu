@@ -151,8 +151,8 @@ __global__ void assign_smem_kernel(const float *__restrict__ x_col, int64_t N, i
     // One dynamic allocation holding two disjoint regions (launch_config.h
     // assign_smem_shared_bytes): the T_K x T_D centroid tile first, then one 8-byte change-count
     // slot per thread. Declaring the array as the 8-byte type gives the reduction its natural
-    // alignment, and T_D is validated as a multiple of the warp size (VAL-010), so the tile
-    // occupies a whole number of 8-byte words and the reduction region starts aligned.
+    // alignment, and T_D is validated as a multiple of 16 (VAL-010), so the tile occupies a
+    // whole number of 8-byte words and the reduction region starts aligned.
     static_assert(TD % 2 == 0, "T_D must be even so the centroid tile fills whole 8-byte words");
     extern __shared__ unsigned long long s_raw[];
     float *const s_tile = reinterpret_cast<float *>(s_raw);

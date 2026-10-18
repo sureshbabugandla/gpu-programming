@@ -35,7 +35,11 @@ explained and bounded by NUM-005, not tolerated.
 `T_K` and `T_D` are compile-time constants with defaults 8 and 32. The PERF-003 tile sweep
 (`T_K ∈ {4,8,16}`, `T_D ∈ {16,32}`) recompiles with `-DKMEANS_TILE_K` / `-DKMEANS_TILE_D` rather
 than passing a runtime option, which is what keeps the partial distances in registers and leaves
-the CLI of BLD-003a unchanged.
+the CLI of BLD-003a unchanged. VAL-010 accepts a `T_D` that is a multiple of 16, which is both
+ends of that sweep: the kernel needs an even `T_D` so the tile fills whole 8-byte words and the
+change-count reduction behind it starts aligned, and 16 floats is exactly one 64-byte segment
+per tile row, so the cooperative load stays coalesced. A `T_D` that is not a whole number of
+segments — 8, 24 — is rejected at startup.
 
 #### What shared memory is and is not expected to buy (SMEM-005)
 

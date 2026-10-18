@@ -344,7 +344,11 @@ void test_u11_size_calculator()
                                                                 "of 32");
         check(!validate_options(2048, 0, 8, 32, 1024, 49152).ok, "block size above 1024 rejected");
         check(!validate_options(256, -1, 8, 32, 1024, 49152).ok, "negative G rejected");
-        check(!validate_options(256, 0, 8, 48, 1024, 49152).ok, "tile_d not a multiple of 32");
+        check(validate_options(256, 0, 8, 16, 1024, 49152).ok,
+              "tile_d 16 is accepted: it is the lower end of the PERF-003 tile sweep");
+        check(!validate_options(256, 0, 8, 24, 1024, 49152).ok, "tile_d not a multiple of 16");
+        check(!validate_options(256, 0, 8, 8, 1024, 49152).ok,
+              "tile_d 8 is rejected: half a 64-byte segment per tile row");
         check(!validate_options(256, 0, 1024, 32, 1024, 49152).ok,
               "tiles larger than the shared-memory limit rejected (EDGE-34)");
     }
