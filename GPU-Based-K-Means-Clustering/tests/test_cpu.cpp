@@ -1038,6 +1038,20 @@ void test_cli_options()
         }
         p = parse_args(args, &o);
         check(!p.ok, "--reps with --verify lockstep is rejected (FR-019: never a sample)");
+
+        args = base_args();
+        for (const char *extra : {"--profile-phases", "--verify", "lockstep"}) {
+            args.push_back(extra);
+        }
+        p = parse_args(args, &o);
+        check(!p.ok, "--profile-phases with --verify lockstep is rejected (PERF-007: the "
+                     "per-iteration verification copies land between two phase marks)");
+
+        args = base_args();
+        args.push_back("--profile-phases");
+        p = parse_args(args, &o);
+        check(p.ok && o.profile_phases,
+              "--profile-phases on its own is accepted: " + p.rule + " " + p.message);
     }
 
     {
@@ -1164,6 +1178,25 @@ void test_i08_reporting()
         check(row.find(",CONVERGED_ASSIGNMENTS,") != std::string::npos, "the status column");
         check(row.find(",NA,NA,NA,NA,") != std::string::npos,
               "the four PERF-007 phase columns are NA outside phase-timing mode");
+        check(summary_json(r).find("\"t_assign\": null") != std::string::npos,
+              "and null in the JSON summary, where 0 would claim a phase took no time");
+    }
+
+    {
+        TestScope scope("I08", "PERF-007: a phase-timing row carries the four phase columns");
+        RunReport r = sample_report();
+        r.has_phases = true;
+        r.t_assign_ms = 12.5;
+        r.t_accum_ms = 3.25;
+        r.t_update_ms = 0.5;
+        r.t_conv_ms = 0.125;
+        const std::string row = csv_row(r);
+        check(row.find(",12.5,3.25,0.5,0.125,") != std::string::npos,
+              "the phase columns hold the measured sums: " + row.substr(0, 400));
+        const std::string json = summary_json(r);
+        check(json.find("\"t_assign\": 12.5") != std::string::npos &&
+                  json.find("\"t_conv\": 0.125") != std::string::npos,
+              "and the JSON summary reports them too");
     }
 
     {

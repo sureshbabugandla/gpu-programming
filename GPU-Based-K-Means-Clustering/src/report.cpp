@@ -235,6 +235,19 @@ std::string summary_json(const RunReport &report)
            std::string(report.timing_valid ? "true" : "false") + "\n";
     out += "  },\n";
 
+    // PERF-007 phase sums, null unless --profile-phases measured them. They cover the T_alg
+    // region; the remainder is the per-iteration 16-byte transfer and the host decision gap,
+    // which belong to no phase.
+    out += "  \"phase_ms\": {\n";
+    const bool ph = report.has_phases;
+    out += "    \"t_assign\": " + (ph ? json_num(report.t_assign_ms) : std::string("null")) +
+           ",\n";
+    out += "    \"t_accum\": " + (ph ? json_num(report.t_accum_ms) : std::string("null")) + ",\n";
+    out += "    \"t_update\": " + (ph ? json_num(report.t_update_ms) : std::string("null")) +
+           ",\n";
+    out += "    \"t_conv\": " + (ph ? json_num(report.t_conv_ms) : std::string("null")) + "\n";
+    out += "  },\n";
+
     // PERF-008 environment record.
     out += "  \"environment\": {\n";
     out += "    \"gpu_name\": " + json_string(report.env.gpu_name) + ",\n";
@@ -311,8 +324,13 @@ std::string csv_row(const RunReport &report)
     r += num(report.t_h2d_ms) + ",";
     r += num(report.t_d2h_ms) + ",";
     // PERF-007 phase columns. Phase timing is a separate mode and is not mixed with headline
-    // numbers, so the columns are NA until a phase-timing run fills them.
-    r += "NA,NA,NA,NA,";
+    // numbers, so the columns stay NA unless --profile-phases measured them.
+    if (report.has_phases) {
+        r += num(report.t_assign_ms) + "," + num(report.t_accum_ms) + "," +
+             num(report.t_update_ms) + "," + num(report.t_conv_ms) + ",";
+    } else {
+        r += "NA,NA,NA,NA,";
+    }
     r += num(report.objective) + ",";
     r += csv_field(report.correctness_status) + ",";
     r += csv_field(report.env.gpu_name) + ",";

@@ -143,9 +143,12 @@ MANIFEST = (
           Md("08_test_suite.md"), Code("08_test_suite.py"))),
     Part(9, "Sanitizer cells", "M5",
          (Md("09_sanitizers.md"), Code("09_sanitizers.py"))),
-    Part(10, "Benchmark cells", "M6", note="PERF-003 matrix, CSVs per section 13.1"),
-    Part(11, "Analysis cells", "M6", note="time vs. N, D, K; numerical comparison tables"),
-    Part(12, "Written evaluation and limitations", "M6", note="section 1.5 deliverable 5"),
+    Part(10, "Benchmark cells", "M6",
+         (Md("10_benchmarks.md"), Code("10_benchmarks.py"))),
+    Part(11, "Analysis cells", "M6",
+         (Md("11_analysis.md"), Code("11_analysis.py"))),
+    Part(12, "Written evaluation and limitations", "M6",
+         (Md("12_evaluation.md"), Code("12_evaluation.py"))),
 )
 
 

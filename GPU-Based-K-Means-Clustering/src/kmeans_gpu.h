@@ -37,10 +37,21 @@ struct Options {
     uint64_t reduction_cap_bytes = 0;  // MEM-003 user cap on B_red; 0 means no explicit cap
     Verify verify = Verify::kNone;
 
+    // PERF-007: record an event pair around each phase of the loop and sum them across
+    // iterations. Off by default because the extra events perturb the totals, which is why
+    // PERF-007 keeps phase runs out of the headline numbers.
+    bool profile_phases = false;
+
     // TEST-U06: fill P, Q, S and n with 0xFF bytes (NaN and 0xFFFFFFFF) after allocation. A
     // correct Approach B overwrites every element of P and Q in Stage 1 and every element of S
     // and n in Stage 2, so the poison must not survive into any result.
     bool poison_buffers = false;
+
+    // TEST-R02: copy the finalization sums S to the host alongside the result. S is the binary64
+    // accumulator the section 2.8 step 1 pass fills, and M = fl32(S/n) is formed from it; the
+    // reproducibility report needs S itself because rounding to binary32 hides last-bit
+    // differences. The copy happens after the T_alg end event, so it costs the timings nothing.
+    bool capture_sums = false;
 };
 
 // What the run reports about itself beyond the clustering Result.
@@ -64,7 +75,20 @@ struct RunInfo {
     // not comparable and must never be used as a benchmark sample.
     bool timing_valid = true;
 
+    // PERF-007 phase sums in milliseconds, filled only when options.profile_phases is set. They
+    // cover the same region as t_alg_ms and sum to less than it: the per-iteration 16-byte
+    // transfer and the host decision gap belong to no phase and are left unattributed rather
+    // than folded into one.
+    double t_assign_ms = 0.0;
+    double t_accum_ms = 0.0;
+    double t_update_ms = 0.0;
+    double t_conv_ms = 0.0;
+    bool phases_measured = false;
+
     double max_centroid_difference = 0.0;  // worst |C_final - M| from the P2 check (section 2.8)
+
+    // TEST-R02, filled only when options.capture_sums is set: K*D binary64 finalization sums.
+    std::vector<double> final_sums;
 };
 
 // The snapshot record and the comparison that judges it live in lockstep.h, free of CUDA, so the

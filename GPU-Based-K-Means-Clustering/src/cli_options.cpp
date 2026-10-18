@@ -249,6 +249,15 @@ CliParse parse_cli(int argc, const char *const *argv, CliOptions *out)
                               "become a benchmark sample");
     }
 
+    // PERF-007 phase timing puts an event pair around each phase; the lockstep downloads sit
+    // between two of those marks, so the phases would measure the verification and not the
+    // kernels. The two modes answer different questions and are kept apart.
+    if (o.profile_phases && o.verify == VerifyMode::kLockstep) {
+        return fail("PERF-007", "--profile-phases cannot be combined with --verify lockstep: the "
+                                "per-iteration downloads land inside the measured phases, so the "
+                                "phase sums would describe the verification");
+    }
+
     *out = o;
     return CliParse{};
 }

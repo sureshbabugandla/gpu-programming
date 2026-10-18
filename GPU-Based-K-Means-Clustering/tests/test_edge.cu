@@ -1092,6 +1092,11 @@ Dataset make_wide_magnitude_dataset(int64_t N, int64_t D, int64_t K, uint64_t se
 struct ReproDataset {
     std::string name;
     std::string why;
+    // True when every binary32 addend of this dataset is absorbed exactly into the binary64
+    // running sum, so no summation order can change S. It decides what the TEST-R02 conclusion
+    // is allowed to claim: on a dataset where the sums are not exact, "no difference observed"
+    // is an observation about one set of runs and never evidence that the sums are exact.
+    bool sums_exact = false;
     int64_t N = 0, D = 0, K = 0;
     std::vector<float> X, C0;
 };
@@ -1110,7 +1115,7 @@ void test_reproducibility(int64_t runs)
         const Dataset data = generate(p);
         datasets.push_back({"blobs", "every binary32 addend is within 2^29 of the running sum, so "
                                      "the binary64 partial sums are exact and order-independent",
-                            p.N, p.D, p.K, data.X, data.C0});
+                            true, p.N, p.D, p.K, data.X, data.C0});
     }
     {
         const int64_t N = 2000000, D = 4, K = 8;
@@ -1118,7 +1123,7 @@ void test_reproducibility(int64_t runs)
         datasets.push_back({"wide-magnitude",
                             "magnitudes span about 2^40, past the 2^29 window in which a binary32 "
                             "addend is absorbed exactly, so the binary64 sums depend on the order",
-                            N, D, K, data.X, data.C0});
+                            false, N, D, K, data.X, data.C0});
     }
 
     for (const ReproDataset &ds : datasets) {
@@ -1152,6 +1157,11 @@ void test_reproducibility(int64_t runs)
             // than of the runtime's memory accounting.
             options.config.reduce_chunks = 1024;
             options.m_range = m_range;
+            // The binary64 sums themselves, not only the binary32 centroids derived from them:
+            // C = fl32(S/n) keeps 24 of the 53 bits of S, so a run-to-run difference in S is
+            // usually invisible in |dC| and reporting only |dC| would understate what the
+            // atomic order does (ATOM-007).
+            options.capture_sums = true;
 
             Result first;
             gpu::RunInfo info;
@@ -1159,10 +1169,12 @@ void test_reproducibility(int64_t runs)
                             gpu::LockstepHook(), "run 1")) {
                 continue;
             }
+            const std::vector<double> first_sums = info.final_sums;
 
             const double s_max = s_max_from_range(m_range);
             int64_t differing = 0, assignment_differing = 0, out_of_tolerance = 0;
             double worst_centroid = 0.0;
+            double worst_sum = 0.0;
             std::string first_difference;
             for (int64_t run = 2; run <= runs; ++run) {
                 Result again;
@@ -1196,6 +1208,15 @@ void test_reproducibility(int64_t runs)
                         ++out_of_tolerance;
                     }
                 }
+                // The finalization sums of section 2.8 step 1, compared element by element. Both
+                // runs accumulated over the same A_final unless the assignments differ, which
+                // the counter above records separately.
+                for (size_t e = 0; e < first_sums.size() && e < info.final_sums.size(); ++e) {
+                    const double diff = std::fabs(first_sums[e] - info.final_sums[e]);
+                    if (diff > worst_sum) {
+                        worst_sum = diff;
+                    }
+                }
                 check(again.status == first.status, "run " + std::to_string(run) +
                                                         ": same status");
                 check_eq_i64(again.iterations, first.iterations,
@@ -1211,10 +1232,14 @@ void test_reproducibility(int64_t runs)
                                                (first_difference.empty()
                                                     ? std::string()
                                                     : "; first difference: " + first_difference));
-                std::printf("      G = %lld; %lld of %lld runs differed; max |dC| %.3e\n",
+                // max |dS| on the binary64 sums is reported here too: it is the stronger
+                // statement, since two runs can agree on C = fl32(S/n) while their S differ.
+                // For Approach B it must be exactly 0, on either dataset.
+                std::printf("      G = %lld; %lld of %lld runs differed; max |dC| %.3e; "
+                            "max |dS| %.3e on the binary64 sums\n",
                             static_cast<long long>(info.reduce_chunks),
                             static_cast<long long>(differing), static_cast<long long>(runs - 1),
-                            worst_centroid);
+                            worst_centroid, worst_sum);
             } else {
                 // TEST-R02 is a report, not a threshold: ATOM-007 fixes no summation order, so
                 // Approach A may differ run to run. What is checked is only that each run stays
@@ -1228,14 +1253,46 @@ void test_reproducibility(int64_t runs)
                             static_cast<long long>(runs - 1),
                             static_cast<long long>(assignment_differing), worst_centroid,
                             s_max);
+                std::printf("      max |dS| %.3e on the binary64 sums S of the finalization "
+                            "pass. S is reported next to C because C = fl32(S/n) keeps only 24 "
+                            "of the 53 bits of S, so a last-bit difference in S is normally "
+                            "rounded away and invisible in |dC|.\n", worst_sum);
                 if (!first_difference.empty()) {
                     std::printf("      first difference observed: %s\n",
                                 first_difference.c_str());
                 }
-                if (differing == 0) {
-                    std::printf("      no difference observed: on this dataset the binary64 "
-                                "partial sums are exact, so the atomic order does not change the "
-                                "result. That is expected here, not a guarantee (ATOM-007).\n");
+                // What "no difference" is allowed to mean depends on the dataset, which is why
+                // ReproDataset carries sums_exact. Claiming exactness on the wide-magnitude set
+                // would contradict the reason that set exists.
+                if (ds.sums_exact) {
+                    if (differing == 0 && worst_sum == 0.0) {
+                        std::printf("      no difference observed, and none was expected: on "
+                                    "this dataset every binary32 addend lands within 2^29 of the "
+                                    "running sum, so each binary64 partial sum is exact and no "
+                                    "atomic order can change S. Expected here, not a guarantee "
+                                    "(ATOM-007).\n");
+                    } else {
+                        std::printf("      a difference was observed on a dataset whose sums "
+                                    "should be exact; ATOM-007 permits it, but the exactness "
+                                    "argument above does not explain it and it is worth "
+                                    "investigating.\n");
+                    }
+                } else if (worst_sum > 0.0) {
+                    std::printf("      the atomic order did change the binary64 sums on this "
+                                "dataset (max |dS| above)%s. This is what ATOM-007 permits and "
+                                "the wide-magnitude dataset is built to expose.\n",
+                                worst_centroid == 0.0
+                                    ? ", while every reported binary32 centroid still matched "
+                                      "run 1: dividing by n and rounding to binary32 absorbed "
+                                      "the difference"
+                                    : "");
+                } else {
+                    std::printf("      no difference observed in these %lld runs. On this "
+                                "dataset the binary64 sums are NOT exact -- magnitudes span "
+                                "about 2^40, far past the 2^29 absorption window -- so this says "
+                                "that the atomic order happened to repeat, not that the order "
+                                "cannot matter. ATOM-007 promises nothing here.\n",
+                                static_cast<long long>(runs));
                 }
             }
         }

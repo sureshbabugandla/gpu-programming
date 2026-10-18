@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <memory>
 
 #include "cpu_reference.h"
 #include "cuda_util.cuh"
@@ -58,6 +59,92 @@ struct DeviceState {
     DeviceBuffer<double> block_max;
     DeviceBuffer<ConvergenceScalars> scalars;
     PinnedBuffer<ConvergenceScalars> host_scalars;
+};
+
+// PERF-007: boundary events around the four phases, summed across iterations.
+//
+// The marks are recorded on the same stream as the kernels, so each pair measures exactly the
+// span between two points of the launch sequence. Elapsed times are read only at a point where
+// the stream has already been synchronised -- the end of an iteration, which the 16-byte
+// convergence copy forces anyway (CUDA-011) -- so phase timing adds events but no extra
+// synchronisation. The seven events are created once and reused: an iteration's marks are read
+// before the next iteration re-records them.
+//
+//   m0 -> m1  accumulate (Approach A's zeroing memsets included: they are part of its cost)
+//   m1 -> m2  update
+//   m2 -> m3  movement + max_reduce            (the convergence test)
+//   m3 -> m4  the `changed` memset + assignment
+//   m5 -> m6  the initial assignment pass, outside the loop
+//
+// The finalization accumulate and update (section 2.8 step 1) reuse m0..m2 after the loop.
+struct PhaseTimers {
+    bool enabled = false;
+    std::unique_ptr<CudaEvent> marks[7];
+    double assign_ms = 0.0;
+    double accum_ms = 0.0;
+    double update_ms = 0.0;
+    double conv_ms = 0.0;
+    bool initial_pending = false;  // m5/m6 recorded, not yet added
+
+    explicit PhaseTimers(bool on) : enabled(on)
+    {
+        if (!on) {
+            return;
+        }
+        for (std::unique_ptr<CudaEvent> &mark : marks) {
+            mark.reset(new CudaEvent());
+        }
+    }
+
+    void mark(int index, cudaStream_t stream)
+    {
+        if (enabled) {
+            marks[index]->record(stream);
+        }
+    }
+
+    // m5/m6 now bracket the initial assignment pass; its elapsed time is added at the next
+    // point where the stream is known to be idle.
+    void initial_recorded() { initial_pending = enabled; }
+
+    double span(int from, int to) const
+    {
+        return static_cast<double>(CudaEvent::elapsed_ms(*marks[from], *marks[to]));
+    }
+
+    // Called after the stream has been synchronised at the end of an iteration.
+    void add_iteration()
+    {
+        if (!enabled) {
+            return;
+        }
+        accum_ms += span(0, 1);
+        update_ms += span(1, 2);
+        conv_ms += span(2, 3);
+        assign_ms += span(3, 4);
+        add_initial();
+    }
+
+    // The initial pass is added at the first point where the stream is known to be idle, which
+    // is the end of the first iteration, or the end of the run when max_iter is 0 (VAL-004).
+    void add_initial()
+    {
+        if (enabled && initial_pending) {
+            assign_ms += span(5, 6);
+            initial_pending = false;
+        }
+    }
+
+    // The finalization accumulate and update, added after the T_alg end event.
+    void add_finalization()
+    {
+        if (!enabled) {
+            return;
+        }
+        accum_ms += span(0, 1);
+        update_ms += span(1, 2);
+        add_initial();
+    }
 };
 
 }  // namespace
@@ -190,12 +277,16 @@ Result run(const float *X, const float *C0, const Options &options, RunInfo *inf
 
     CudaEvent alg_start;
     CudaEvent alg_end;
+    PhaseTimers phases(options.profile_phases);
 
     // --- section 2.7 ---------------------------------------------------------------------------
     alg_start.record(dev.stream.get());
 
     // The initial assignment pass has no previous assignment, so it counts no changes.
+    phases.mark(5, dev.stream.get());
     assign_pass(c_cur, false);
+    phases.mark(6, dev.stream.get());
+    phases.initial_recorded();
 
     int64_t t = 0;
     Status status = Status::ITERATION_LIMIT;
@@ -204,12 +295,16 @@ Result run(const float *X, const float *C0, const Options &options, RunInfo *inf
 
     while (t < cfg.max_iter) {
         // CUDA-003 launch sequence, in order, on one stream.
+        phases.mark(0, dev.stream.get());
         accumulate();
+        phases.mark(1, dev.stream.get());
         launch_update(dev.sums.get(), dev.counts.get(), K, D, c_cur, c_next, block, sm_count,
                       dev.stream.get());
+        phases.mark(2, dev.stream.get());
         launch_movement(c_cur, c_next, dev.counts.get(), K, D, dev.block_max.get(), block,
                         sm_count, dev.stream.get());
         launch_max_reduce(dev.block_max.get(), movement_blocks, &scalars->delta, dev.stream.get());
+        phases.mark(3, dev.stream.get());
 
         LockstepSnapshot snapshot;
         const bool lockstep = options.verify == Verify::kLockstep && static_cast<bool>(hook);
@@ -240,11 +335,15 @@ Result run(const float *X, const float *C0, const Options &options, RunInfo *inf
         // c_next holds C(t+1): the pointer swap below is bookkeeping, so the assignment pass of
         // iteration t reads the buffer the update just wrote.
         assign_pass(c_next, true);
+        phases.mark(4, dev.stream.get());
 
         // CUDA-011: the only in-loop transfer, 16 bytes into pinned host memory.
         KMEANS_CUDA_CHECK(cudaMemcpyAsync(host_scalars, scalars, sizeof(ConvergenceScalars),
                                           cudaMemcpyDeviceToHost, dev.stream.get()));
         dev.stream.synchronize();
+        // The stream is idle here, so every mark of this iteration has completed and its elapsed
+        // time can be read without adding a synchronisation of its own (PERF-007).
+        phases.add_iteration();
 
         const double delta = host_scalars->delta;
         const int64_t changed = static_cast<int64_t>(host_scalars->changed);
@@ -289,11 +388,22 @@ Result run(const float *X, const float *C0, const Options &options, RunInfo *inf
     // Step 1: one accumulation pass over A_final with the selected strategy, then the update
     // kernel turns (S, n) into M = fl32(S/n) for non-empty k. C_final itself is never touched:
     // the means land in the scratch centroid buffer.
+    phases.mark(0, dev.stream.get());
     accumulate();
+    phases.mark(1, dev.stream.get());
     launch_update(dev.sums.get(), dev.counts.get(), K, D, c_cur, c_next, block, sm_count,
                   dev.stream.get());
+    phases.mark(2, dev.stream.get());
     alg_end.record(dev.stream.get());
     out.t_alg_ms = static_cast<double>(CudaEvent::elapsed_ms(alg_start, alg_end));
+
+    // elapsed_ms above synchronised on alg_end, so the finalization marks have completed.
+    phases.add_finalization();
+    out.t_assign_ms = phases.assign_ms;
+    out.t_accum_ms = phases.accum_ms;
+    out.t_update_ms = phases.update_ms;
+    out.t_conv_ms = phases.conv_ms;
+    out.phases_measured = options.profile_phases;
 
     Result result;
     result.assignments.resize(static_cast<size_t>(N));
@@ -311,6 +421,13 @@ Result run(const float *X, const float *C0, const Options &options, RunInfo *inf
     KMEANS_CUDA_CHECK(cudaMemcpyAsync(result.counts.data(), dev.counts.get(),
                                       static_cast<size_t>(K) * sizeof(uint32_t),
                                       cudaMemcpyDeviceToHost, dev.stream.get()));
+    // TEST-R02: S as the finalization pass left it, before fl32(S/n) throws away 29 of its bits.
+    // Inside the T_d2h window and outside T_alg, so a capture run's T_d2h is larger by one KD
+    // copy and its T_alg is unaffected; capture is used by tests, never by a benchmark row.
+    if (options.capture_sums) {
+        out.final_sums.resize(kd);
+        dev.sums.copy_to_host(out.final_sums.data(), kd, dev.stream.get());
+    }
     dev.stream.synchronize();
     out.t_d2h_ms = ms_since(d2h_start);
     out.t_e2e_ms = ms_since(e2e_start);

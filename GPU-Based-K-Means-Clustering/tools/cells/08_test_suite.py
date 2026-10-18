@@ -164,8 +164,10 @@ cases = [
     ("RED-007", "a G beyond N: insufficient resources, exit 3",
      ["--data", GOOD_X, "--centroids", GOOD_C, "--k", "6", "--strategy", "reduction",
       "--reduce-chunks", "999999"], 3, "RED-007"),
-    ("PERF-007", "--profile-phases is refused rather than reporting nothing",
-     ["--data", GOOD_X, "--centroids", GOOD_C, "--k", "6", "--profile-phases"], 2, "M6"),
+    ("PERF-007", "--profile-phases with --verify lockstep, whose per-iteration copies would "
+                 "land inside the measured phases",
+     ["--data", GOOD_X, "--centroids", GOOD_C, "--k", "6", "--profile-phases",
+      "--verify", "lockstep"], 2, "PERF-007"),
 ]
 
 def diagnostic_line(output):
@@ -322,6 +324,44 @@ if code == 0:
     check((raw["tile_k"].astype(str) == "NA").all(),
           "the tile columns are NA for the baseline assignment kernel")
     print(f"  ok   {len(raw)} raw rows, t_alg median {raw['t_alg_ms'].median():.3f} ms "
+          "(plumbing check, not a benchmark result)")
+
+# PERF-007: the phase columns of §13.1, which are NA in every row above. The phases cover the
+# T_alg region and cannot sum past it; what they leave out is the per-iteration 16-byte transfer
+# and the host decision gap, which belong to no phase.
+PHASE_CSV = os.path.join(CSV_DIR, "suite_phases_raw.csv")
+if os.path.exists(PHASE_CSV):
+    os.remove(PHASE_CSV)
+
+code, output = run(["./kmeans", "--data", GOOD_X, "--centroids", GOOD_C, "--k", "6",
+                    "--max-iter", "7", "--tol", "0.0", "--strategy", "reduction",
+                    "--assign", "smem", "--fixed-iters", "--profile-phases",
+                    "--reps", str(reps), "--warmup", "1", "--csv", PHASE_CSV],
+                   label="PERF-007 phase-timing run")
+print(output, end="")
+
+if code == 0:
+    check(any(line.startswith("phases:") for line in output.splitlines()),
+          "the run prints a phase breakdown")
+    check("warning[PERF-007]" in output,
+          "and says that phase rows are perturbed and not headline numbers")
+    phase_raw = pd.read_csv(PHASE_CSV, keep_default_na=False)
+    phase_cols = ["t_assign_ms", "t_accum_ms", "t_update_ms", "t_conv_ms"]
+    check(len(phase_raw) == reps, f"the phase run wrote {reps} rows: got {len(phase_raw)}")
+    numeric = phase_raw[phase_cols].apply(pd.to_numeric, errors="coerce")
+    check(numeric.notna().all().all(),
+          f"every phase column holds a number, not NA: {phase_raw[phase_cols].head(1).to_dict()}")
+    check((numeric >= 0).all().all(), "no phase sum is negative")
+    total = numeric.sum(axis=1)
+    # Not a per-phase "> 0": on a dataset this small the update and convergence kernels run in a
+    # few microseconds and a phase could legitimately round to zero at the event resolution. The
+    # claim that matters is that the phases are inside T_alg and account for most of it.
+    check((total > 0).all(), "the phases account for some of t_alg")
+    check((total <= phase_raw["t_alg_ms"] * 1.001).all(),
+          "the phases sum to no more than t_alg, which is the region they cover: "
+          f"worst ratio {(total / phase_raw['t_alg_ms']).max():.4f}")
+    print(f"  ok   phases over {len(phase_raw)} rows: median sum "
+          f"{total.median():.3f} ms of t_alg median {phase_raw['t_alg_ms'].median():.3f} ms "
           "(plumbing check, not a benchmark result)")
 
 # --- the verdict --------------------------------------------------------------------------------

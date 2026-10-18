@@ -163,16 +163,6 @@ int main(int argc, char **argv)
         return parse.exit_code;
     }
 
-    // PERF-007 phase timing needs event pairs around each phase of the loop; those arrive with the
-    // benchmark section in M6. Refusing the option is the honest behaviour: accepting it and
-    // reporting nothing would put empty phase columns in a CSV that claims to hold measurements
-    // (PERF-011).
-    if (opt.profile_phases) {
-        report_error("PERF-007", "--profile-phases is not implemented yet (milestone M6, the "
-                                 "benchmark section); run without it");
-        return kExitInvalidInput;
-    }
-
     // --- VAL-010, the part that needs no device ------------------------------------------------
     // Passing 0 for the two device limits skips the checks that need them, so an option outside
     // its documented range is named as such whatever the machine has: a block size of 100 is a
@@ -241,6 +231,7 @@ int main(int argc, char **argv)
     run_options.config = opt.to_config(N, D);
     run_options.m_range = m_range;
     run_options.verify = to_gpu_verify(opt.verify);
+    run_options.profile_phases = opt.profile_phases;
 
     // FR-019 lockstep: the same comparison the test suite uses (lockstep.h), so a failure here and
     // a TEST-I10 failure mean the same thing.
@@ -277,6 +268,9 @@ int main(int argc, char **argv)
     Result result;
     gpu::RunInfo info;
     std::vector<double> t_alg, t_e2e;
+    // PERF-007: one phase sum per repetition, so a phase-timing row carries that repetition's
+    // own phases rather than the last one's.
+    std::vector<double> t_assign, t_accum, t_update, t_conv;
     RunReport report;
 
     try {
@@ -296,6 +290,10 @@ int main(int argc, char **argv)
             result = gpu::run(x_ptr, C0.data.data(), run_options, &info, hook);
             t_alg.push_back(info.t_alg_ms);
             t_e2e.push_back(info.t_e2e_ms);
+            t_assign.push_back(info.t_assign_ms);
+            t_accum.push_back(info.t_accum_ms);
+            t_update.push_back(info.t_update_ms);
+            t_conv.push_back(info.t_conv_ms);
 
             report = RunReport{};
             report.env = env;
@@ -322,6 +320,11 @@ int main(int argc, char **argv)
             report.t_h2d_ms = info.t_h2d_ms;
             report.t_d2h_ms = info.t_d2h_ms;
             report.timing_valid = info.timing_valid;
+            report.t_assign_ms = info.t_assign_ms;
+            report.t_accum_ms = info.t_accum_ms;
+            report.t_update_ms = info.t_update_ms;
+            report.t_conv_ms = info.t_conv_ms;
+            report.has_phases = info.phases_measured;
             report.objective = result.objective;
             report.counts = result.counts;
             report.run_id = make_run_id(report);
@@ -364,6 +367,21 @@ int main(int argc, char **argv)
                 "t_d2h %.3f ms%s\n",
                 info.t_alg_ms, info.t_e2e_ms, info.t_alloc_ms, info.t_h2d_ms, info.t_d2h_ms,
                 info.timing_valid ? "" : "  [NOT a benchmark sample: FR-019 verification]");
+
+    // PERF-007: the phases are sums over the whole T_alg region, so what they do not account for
+    // is the per-iteration 16-byte transfer and the host decision gap (CUDA-011, section 2.7).
+    // Reporting that remainder rather than distributing it keeps the four numbers measurements.
+    if (info.phases_measured) {
+        const double sum = info.t_assign_ms + info.t_accum_ms + info.t_update_ms + info.t_conv_ms;
+        std::printf("phases: assign %.3f ms, accumulate %.3f ms, update %.3f ms, "
+                    "convergence %.3f ms; sum %.3f ms of t_alg %.3f ms "
+                    "(%.3f ms unattributed: the 16-byte transfer and the host decision gap)\n",
+                    info.t_assign_ms, info.t_accum_ms, info.t_update_ms, info.t_conv_ms, sum,
+                    info.t_alg_ms, info.t_alg_ms - sum);
+        std::printf("warning[PERF-007]: phase timing records extra events inside the loop, which "
+                    "perturbs the totals; these rows are reported separately and are not "
+                    "headline numbers\n");
+    }
 
     if (opt.reps > 0) {
         const Statistics alg = statistics(t_alg);
@@ -435,8 +453,13 @@ int main(int argc, char **argv)
         for (int64_t rep = 1; rep <= measured; ++rep) {
             RunReport row = report;
             row.rep_index = rep;
-            row.t_alg_ms = t_alg[static_cast<size_t>(rep - 1)];
-            row.t_e2e_ms = t_e2e[static_cast<size_t>(rep - 1)];
+            const size_t r = static_cast<size_t>(rep - 1);
+            row.t_alg_ms = t_alg[r];
+            row.t_e2e_ms = t_e2e[r];
+            row.t_assign_ms = t_assign[r];
+            row.t_accum_ms = t_accum[r];
+            row.t_update_ms = t_update[r];
+            row.t_conv_ms = t_conv[r];
             row.run_id = make_run_id(row);
             if (append_csv_row(opt.csv_path, row, &err) != kExitOk) {
                 report_error("PERF-011", err);

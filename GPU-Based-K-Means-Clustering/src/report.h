@@ -69,6 +69,14 @@ struct RunReport {
     double t_d2h_ms = 0.0;
     bool timing_valid = true;  // FR-019: false for a lockstep run
 
+    // PERF-007 phase sums, written to the CSV only when has_phases; the four columns are NA
+    // otherwise, because a zero there would claim a phase took no time.
+    double t_assign_ms = 0.0;
+    double t_accum_ms = 0.0;
+    double t_update_ms = 0.0;
+    double t_conv_ms = 0.0;
+    bool has_phases = false;
+
     double objective = 0.0;
 
     // PERF-001: PASS or FAIL from --verify, NOT_CHECKED without it.
