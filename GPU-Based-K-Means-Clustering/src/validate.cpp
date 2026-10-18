@@ -4,6 +4,8 @@
 #include <cmath>
 #include <map>
 
+#include "launch_config.h"
+
 namespace kmeans {
 namespace {
 
@@ -145,16 +147,27 @@ Validation validate_options(int block_size, int64_t reduce_chunks, int tile_k, i
         return fail("VAL-010", "tile_d must be a multiple of the warp size 32, got " + istr(tile_d),
                     kExitInvalidInput);
     }
-    uint64_t shared_bytes = 0;
+    uint64_t tile_bytes = 0;
     if (!checked_mul(static_cast<uint64_t>(tile_k) * 4, static_cast<uint64_t>(tile_d),
+                     &tile_bytes)) {
+        return fail("VAL-010", "tile sizes overflow the shared-memory calculation",
+                    kExitInvalidInput);
+    }
+    // What assign_smem actually requests is the tile plus its change-count reduction, so that sum
+    // is what has to fit; checking only the tile would let a configuration through that then
+    // failed at the launch (EDGE-34).
+    uint64_t shared_bytes = 0;
+    if (!checked_add(tile_bytes, static_cast<uint64_t>(block_reduction_bytes(block_size)),
                      &shared_bytes)) {
         return fail("VAL-010", "tile sizes overflow the shared-memory calculation",
                     kExitInvalidInput);
     }
     if (device_shared_mem_per_block > 0 &&
         shared_bytes > static_cast<uint64_t>(device_shared_mem_per_block)) {
-        return fail("VAL-010", "assign_smem tiles need " + ustr(shared_bytes) +
-                                   " B of shared memory, device allows " +
+        return fail("VAL-010", "assign_smem needs " + ustr(shared_bytes) +
+                                   " B of shared memory per block (" + ustr(tile_bytes) +
+                                   " B tile + " + istr(block_reduction_bytes(block_size)) +
+                                   " B change-count reduction), device allows " +
                                    istr(device_shared_mem_per_block) + " B per block",
                     kExitInvalidInput);
     }

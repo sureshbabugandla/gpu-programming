@@ -20,6 +20,8 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -59,18 +61,86 @@ inline void cuda_throw(cudaError_t status, const char *call, const char *file, i
         }                                                                         \
     } while (0)
 
+// --- MEM-008 fault injection -------------------------------------------------------------------
+//
+// EDGE-27 (allocation failure despite the VAL-009 pre-check) and EDGE-28 (launch failure) cannot
+// be provoked by any legal input: the pre-check is there precisely to make the first impossible,
+// and a launch configuration this code computes is always valid. They are reached through two
+// environment variables instead of by exhausting real memory, which keeps the test cheap, keeps
+// it repeatable, and keeps the hook out of the way of every normal run:
+//
+//   KMEANS_FAIL_ALLOC=n       the n-th device allocation of the process fails (1-based)
+//   KMEANS_FAIL_LAUNCH=name   the next launch of that kernel fails
+//
+// Both paths go through the ordinary CUDA-008 error handling, so what the tests observe is the
+// real cleanup path: the RAII owners unwind, the message names the rule, and the exit code is 4.
+// The variables are read once per process.
+
+inline int64_t fault_injection_alloc_index()
+{
+    static const int64_t index = []() -> int64_t {
+        const char *text = std::getenv("KMEANS_FAIL_ALLOC");
+        if (text == nullptr) {
+            return 0;
+        }
+        const long long value = std::strtoll(text, nullptr, 10);
+        return value > 0 ? static_cast<int64_t>(value) : 0;
+    }();
+    return index;
+}
+
+inline const char *fault_injection_launch_name()
+{
+    static const char *const name = std::getenv("KMEANS_FAIL_LAUNCH");
+    return name;
+}
+
+// True when this allocation is the one MEM-008 was asked to fail. The counter advances on every
+// device allocation, so "the n-th" is counted in allocation order, which is the order of the
+// MEM-001 table in kmeans_gpu.cu.
+inline bool fault_injection_should_fail_alloc()
+{
+    const int64_t target = fault_injection_alloc_index();
+    if (target == 0) {
+        return false;
+    }
+    static int64_t seen = 0;
+    return ++seen == target;
+}
+
+inline bool fault_injection_should_fail_launch(const char *kernel_name)
+{
+    const char *target = fault_injection_launch_name();
+    return target != nullptr && kernel_name != nullptr && std::strcmp(target, kernel_name) == 0;
+}
+
+inline void check_injected_launch_failure(const char *kernel_name)
+{
+    if (fault_injection_should_fail_launch(kernel_name)) {
+        throw CudaError(std::string("[MEM-008] launch of '") + kernel_name +
+                            "' failed (fault injected by KMEANS_FAIL_LAUNCH)",
+                        kExitCudaError);
+    }
+}
+
 // CUDA-008: after every launch, cudaGetLastError reports launch errors. With KMEANS_SYNC_CHECK
 // defined (the debug build of BLD-002) a synchronisation follows, so an asynchronous fault is
 // attributed to the kernel that caused it instead of to the next synchronisation point.
+//
+// MEM-008: a kernel named by KMEANS_FAIL_LAUNCH raises here instead. The failure is reported as a
+// launch error with exit code 4 and the same message shape as a real one, because what EDGE-28
+// exercises is the handling, not the fault.
 #ifdef KMEANS_SYNC_CHECK
 #define KMEANS_CHECK_LAUNCH(name)                                                 \
     do {                                                                          \
+        kmeans::check_injected_launch_failure(name);                              \
         KMEANS_CUDA_CHECK(cudaGetLastError());                                    \
         KMEANS_CUDA_CHECK(cudaDeviceSynchronize());                               \
     } while (0)
 #else
 #define KMEANS_CHECK_LAUNCH(name)                                                 \
     do {                                                                          \
+        kmeans::check_injected_launch_failure(name);                              \
         KMEANS_CUDA_CHECK(cudaGetLastError());                                    \
     } while (0)
 #endif
@@ -113,6 +183,15 @@ public:
         release();
         if (count == 0) {
             return;  // a zero-element buffer is legal and stays null; no kernel indexes into it
+        }
+        // MEM-008: EDGE-27 is an allocation that fails although VAL-009 said it would fit. The
+        // injected failure is raised before cudaMalloc, so the buffers allocated before this one
+        // are still live and the unwind exercises the real MEM-007 cleanup path.
+        if (fault_injection_should_fail_alloc()) {
+            throw CudaError("[MEM-008] device allocation of " +
+                                std::to_string(count * sizeof(T)) +
+                                " B failed (fault injected by KMEANS_FAIL_ALLOC)",
+                            kExitCudaError);
         }
         void *raw = nullptr;
         KMEANS_CUDA_CHECK(cudaMalloc(&raw, count * sizeof(T)));

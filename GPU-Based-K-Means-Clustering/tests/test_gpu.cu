@@ -40,83 +40,23 @@
 #include "hand_data.h"
 #include "kmeans_gpu.h"
 #include "launch_config.h"
+#include "lockstep.h"
+#include "test_device.cuh"
+#include "test_harness.h"
 #include "validate.h"
 
 using namespace kmeans;
 
 namespace {
 
-int g_checks = 0;
-int g_failures = 0;
-int g_case_failures = 0;
-
-void check(bool condition, const std::string &what)
-{
-    ++g_checks;
-    if (!condition) {
-        ++g_failures;
-        ++g_case_failures;
-        std::printf("      FAIL  %s\n", what.c_str());
-    }
-}
-
-void check_eq_i64(int64_t got, int64_t want, const std::string &what)
-{
-    check(got == want, what + ": got " + std::to_string(got) + ", want " + std::to_string(want));
-}
-
-std::string float_str(float v)
-{
-    char buf[48];
-    std::snprintf(buf, sizeof(buf), "%.9g", static_cast<double>(v));
-    return std::string(buf);
-}
-
-std::string double_str(double v)
-{
-    char buf[48];
-    std::snprintf(buf, sizeof(buf), "%.17g", v);
-    return std::string(buf);
-}
-
-// Scope guard for the per-test PASS/FAIL line, as in tests/test_cpu.cpp.
-class TestScope {
-public:
-    TestScope(const char *id, const std::string &title)
-    {
-        g_case_failures = 0;
-        std::printf("  %-9s %s\n", id, title.c_str());
-    }
-    ~TestScope() { std::printf("      %s\n", g_case_failures == 0 ? "PASS" : "-> FAILED"); }
-};
-
-const char *strategy_name(Strategy s)
-{
-    return s == Strategy::kAtomic ? "atomic" : "reduction";
-}
-
-const char *assign_name(AssignKernel a)
-{
-    return a == AssignKernel::kBaseline ? "baseline" : "smem";
-}
-
-// Every GPU call path can raise CudaError (cuda_util.cuh). A test must record that as a failure
-// and carry on, not abort the executable, so the remaining tests still report.
-bool run_device(const float *X, const float *C0, const gpu::Options &options, Result *result,
-                gpu::RunInfo *info, const gpu::LockstepHook &hook, const std::string &what)
-{
-    try {
-        *result = gpu::run(X, C0, options, info, hook);
-        return true;
-    } catch (const CudaError &err) {
-        check(false, what + ": " + err.what() + " (exit code " +
-                         std::to_string(err.exit_code()) + ")");
-        return false;
-    } catch (const std::exception &err) {
-        check(false, what + ": " + err.what());
-        return false;
-    }
-}
+using kmeans::tests::assign_name;
+using kmeans::tests::check;
+using kmeans::tests::check_eq_i64;
+using kmeans::tests::double_str;
+using kmeans::tests::float_str;
+using kmeans::tests::run_device;
+using kmeans::tests::strategy_name;
+using kmeans::tests::TestScope;
 
 // --- TEST-I01 / TEST-I02: the hand-verifiable datasets on the device ---------------------------
 
@@ -207,206 +147,10 @@ void test_hand_cases(Strategy strategy)
 
 // --- section 10.3 lockstep -----------------------------------------------------------------------
 
-struct LockstepStats {
-    int64_t iterations = 0;
-    int64_t assign_hard_mismatches = 0;
-    int64_t assign_near_tie_mismatches = 0;
-    int64_t count_mismatches = 0;
-    int64_t sum_violations = 0;
-    int64_t centroid_violations = 0;
-    int64_t change_count_mismatches = 0;
-    int64_t delta_violations = 0;
-    double max_sum_diff = 0.0;
-    double max_centroid_diff = 0.0;
-    double max_delta_diff = 0.0;
-    std::vector<std::string> notes;
-};
-
-// One iteration of section 10.3 item 1. Every kernel of the iteration is judged separately, so a
-// failure names the kernel rather than only the end result:
-//   accumulation  device n exactly, device S within 1e-12 * n_k * S_max (TEST-U04/U05 criterion)
-//   update        device C(t+1) within NUM-006 of the reference update of the same (S, n)
-//   movement      device Delta against the reference movement of the device's own centroids
-//   assign        device A(t+1) against the reference assignment of the device's own C(t+1),
-//                 with disagreements allowed only on near-ties (NUM-005)
-//   change count  exactly, against the reference count of differences between A(t) and A(t+1)
-void check_lockstep_iteration(const gpu::LockstepSnapshot &snap, const float *X,
-                              const Config &config, double m_range, LockstepStats *stats)
-{
-    const int64_t N = config.N;
-    const int64_t D = config.D;
-    const int64_t K = config.K;
-    const double s_max = s_max_from_range(m_range);
-    ++stats->iterations;
-
-    // The very first snapshot also pins down the initial assignment pass of section 2.7, which no
-    // later snapshot covers: for t > 0, A(t) was the previous iteration's A(t+1).
-    if (snap.iteration == 0) {
-        std::vector<int32_t> a_ref(static_cast<size_t>(N), 0);
-        cpu::assign(X, N, D, snap.c_in.data(), K, a_ref.data(), nullptr);
-        for (int64_t i = 0; i < N; ++i) {
-            if (a_ref[static_cast<size_t>(i)] == snap.a_in[static_cast<size_t>(i)]) {
-                continue;
-            }
-            const cpu::TieInfo tie = cpu::tie_info(X + i * D, D, snap.c_in.data(), K);
-            if (tie.near_tie) {
-                ++stats->assign_near_tie_mismatches;
-            } else {
-                ++stats->assign_hard_mismatches;
-                if (stats->notes.size() < 10) {
-                    stats->notes.push_back("initial assign: point " + std::to_string(i) +
-                                           " device " +
-                                           std::to_string(snap.a_in[static_cast<size_t>(i)]) +
-                                           ", reference " +
-                                           std::to_string(a_ref[static_cast<size_t>(i)]) +
-                                           ", margin " + double_str(tie.margin));
-                }
-            }
-        }
-    }
-
-    // Accumulation: the reference is given the device's own A(t).
-    std::vector<double> sums_ref(static_cast<size_t>(K * D), 0.0);
-    std::vector<uint32_t> counts_ref(static_cast<size_t>(K), 0);
-    cpu::accumulate(X, N, D, snap.a_in.data(), K, sums_ref.data(), counts_ref.data());
-
-    uint64_t total_counted = 0;
-    for (int64_t k = 0; k < K; ++k) {
-        const uint32_t got = snap.counts[static_cast<size_t>(k)];
-        total_counted += got;
-        if (got != counts_ref[static_cast<size_t>(k)]) {
-            ++stats->count_mismatches;
-            if (stats->notes.size() < 10) {
-                stats->notes.push_back("n[" + std::to_string(k) + "] device " +
-                                       std::to_string(got) + ", reference " +
-                                       std::to_string(counts_ref[static_cast<size_t>(k)]));
-            }
-        }
-    }
-    // RED-005 / FR-009: every point contributes to exactly one cluster, so the counts sum to N.
-    if (total_counted != static_cast<uint64_t>(N)) {
-        ++stats->count_mismatches;
-        if (stats->notes.size() < 10) {
-            stats->notes.push_back("counts sum to " + std::to_string(total_counted) +
-                                   ", want N = " + std::to_string(N));
-        }
-    }
-
-    for (int64_t k = 0; k < K; ++k) {
-        // |S_kj| <= n_k * M, and binary64 accumulation of n_k terms loses far less than 1e-12 of
-        // that, so the bound is proportional to the largest value the sum could take.
-        const double scale = static_cast<double>(counts_ref[static_cast<size_t>(k)]) * s_max;
-        const double tol = 1e-12 * (scale > s_max ? scale : s_max);
-        for (int64_t j = 0; j < D; ++j) {
-            const size_t e = static_cast<size_t>(k * D + j);
-            const double diff = std::fabs(snap.sums[e] - sums_ref[e]);
-            if (diff > stats->max_sum_diff) {
-                stats->max_sum_diff = diff;
-            }
-            if (!(diff <= tol)) {  // negated so a NaN counts as a violation
-                ++stats->sum_violations;
-                if (stats->notes.size() < 10) {
-                    stats->notes.push_back("S[" + std::to_string(k) + "][" + std::to_string(j) +
-                                           "] device " + double_str(snap.sums[e]) +
-                                           ", reference " + double_str(sums_ref[e]) +
-                                           ", tolerance " + double_str(tol));
-                }
-            }
-        }
-    }
-
-    // Update: the reference update of the same (S, n) must reproduce the device's C(t+1). The
-    // reference is fed its own sums, so this checks the division and the DEC-003 retention, and
-    // tolerates only the one-ulp difference NUM-006 allows.
-    std::vector<float> c_ref(static_cast<size_t>(K * D), 0.0f);
-    cpu::update(sums_ref.data(), counts_ref.data(), K, D, snap.c_in.data(), c_ref.data());
-    for (int64_t k = 0; k < K; ++k) {
-        for (int64_t j = 0; j < D; ++j) {
-            const size_t e = static_cast<size_t>(k * D + j);
-            const double diff = std::fabs(static_cast<double>(snap.c_out[e]) -
-                                          static_cast<double>(c_ref[e]));
-            if (diff > stats->max_centroid_diff) {
-                stats->max_centroid_diff = diff;
-            }
-            if (!centroid_agrees(snap.c_out[e], c_ref[e], s_max)) {
-                ++stats->centroid_violations;
-                if (stats->notes.size() < 10) {
-                    stats->notes.push_back("C[" + std::to_string(k) + "][" + std::to_string(j) +
-                                           "] device " + float_str(snap.c_out[e]) +
-                                           ", reference " + float_str(c_ref[e]));
-                }
-            }
-            if (counts_ref[static_cast<size_t>(k)] == 0u && snap.c_out[e] != snap.c_in[e]) {
-                ++stats->centroid_violations;  // DEC-003: retained bit-exactly
-                if (stats->notes.size() < 10) {
-                    stats->notes.push_back("empty cluster " + std::to_string(k) +
-                                           " was not retained bit-exactly");
-                }
-            }
-        }
-    }
-
-    // Movement: judged against the device's own centroids and counts, so this isolates the
-    // movement and max_reduce kernels from any difference in the centroids themselves.
-    const double delta_ref = cpu::movement(snap.c_in.data(), snap.c_out.data(),
-                                           snap.counts.data(), K, D);
-    const double delta_diff = std::fabs(delta_ref - snap.delta);
-    if (delta_diff > stats->max_delta_diff) {
-        stats->max_delta_diff = delta_diff;
-    }
-    const double delta_tol = 1e-12 * (delta_ref > 1.0 ? delta_ref : 1.0);
-    if (!(delta_diff <= delta_tol)) {
-        ++stats->delta_violations;
-        if (stats->notes.size() < 10) {
-            stats->notes.push_back("Delta device " + double_str(snap.delta) + ", reference " +
-                                   double_str(delta_ref));
-        }
-    }
-
-    // Assignment: the reference is given the device's own C(t+1).
-    const int64_t near_ties_before = stats->assign_near_tie_mismatches;
-    std::vector<int32_t> a_ref(static_cast<size_t>(N), 0);
-    const int64_t changed_ref =
-        cpu::assign(X, N, D, snap.c_out.data(), K, a_ref.data(), snap.a_in.data());
-    for (int64_t i = 0; i < N; ++i) {
-        if (a_ref[static_cast<size_t>(i)] == snap.a_out[static_cast<size_t>(i)]) {
-            continue;
-        }
-        const cpu::TieInfo tie = cpu::tie_info(X + i * D, D, snap.c_out.data(), K);
-        if (tie.near_tie) {
-            ++stats->assign_near_tie_mismatches;
-        } else {
-            ++stats->assign_hard_mismatches;
-            if (stats->notes.size() < 10) {
-                stats->notes.push_back("assign: point " + std::to_string(i) + " device " +
-                                       std::to_string(snap.a_out[static_cast<size_t>(i)]) +
-                                       ", reference " +
-                                       std::to_string(a_ref[static_cast<size_t>(i)]) +
-                                       ", margin " + double_str(tie.margin) + " > threshold " +
-                                       double_str(near_tie_threshold(D)));
-            }
-        }
-    }
-
-    // TEST-U03: the change count is an integer reduction and must be exact. The reference counts
-    // differences between the device's A(t) and its own A(t+1); where a near-tie made the two
-    // assignments differ in this iteration the counts may legitimately differ, so that case is
-    // reported, not failed. The comparison is per iteration: a near-tie seen earlier in the run
-    // must not excuse a wrong count here.
-    if (changed_ref != snap.changed) {
-        if (stats->assign_near_tie_mismatches == near_ties_before) {
-            ++stats->change_count_mismatches;
-            if (stats->notes.size() < 10) {
-                stats->notes.push_back("change count device " + std::to_string(snap.changed) +
-                                       ", reference " + std::to_string(changed_ref));
-            }
-        } else if (stats->notes.size() < 10) {
-            stats->notes.push_back("change count differs by " +
-                                   std::to_string(changed_ref - snap.changed) +
-                                   " with near-ties present (NUM-005), reported not failed");
-        }
-    }
-}
+// LockstepStats and check_lockstep_iteration live in src/lockstep.h so that the section 10.3
+// comparison is one implementation shared with the `--verify lockstep` mode of the kmeans
+// executable (FR-019), and so that the numerical argument it encodes is compiled and tested
+// with g++ on a machine with no GPU. What stays here is only the pass/fail wrapper.
 
 void report_lockstep(const LockstepStats &stats, const std::string &prefix)
 {
@@ -417,11 +161,7 @@ void report_lockstep(const LockstepStats &stats, const std::string &prefix)
     check_eq_i64(stats.centroid_violations, 0, prefix + ": centroid violations (NUM-006)");
     check_eq_i64(stats.delta_violations, 0, prefix + ": Delta violations");
     check_eq_i64(stats.change_count_mismatches, 0, prefix + ": change count mismatches");
-    std::printf("      %lld iterations checked; near-tie assignment differences %lld; "
-                "max |dS| %.3e, max |dC| %.3e, max |dDelta| %.3e\n",
-                static_cast<long long>(stats.iterations),
-                static_cast<long long>(stats.assign_near_tie_mismatches), stats.max_sum_diff,
-                stats.max_centroid_diff, stats.max_delta_diff);
+    std::printf("      %s\n", lockstep_summary(stats).c_str());
     for (const std::string &note : stats.notes) {
         std::printf("      note: %s\n", note.c_str());
     }
@@ -843,57 +583,6 @@ void test_non_aligned(Strategy strategy)
 // difference would mean the tiled kernel reordered arithmetic (NUM-002) or that ptxas contracted
 // a multiply-add in one kernel and not the other, which SMEM-004 requires to be explained.
 
-// Bitwise comparison, so a one-ulp centroid difference is a failure rather than a tolerance hit.
-bool results_identical(const Result &a, const Result &b, std::string *why)
-{
-    if (a.status != b.status) {
-        *why = std::string("status ") + status_name(a.status) + " vs " + status_name(b.status);
-        return false;
-    }
-    if (a.iterations != b.iterations) {
-        *why = "iterations " + std::to_string(a.iterations) + " vs " + std::to_string(b.iterations);
-        return false;
-    }
-    if (a.centroid_consistent != b.centroid_consistent) {
-        *why = "the P2 flag differs";
-        return false;
-    }
-    if (a.has_last_delta != b.has_last_delta ||
-        std::memcmp(&a.last_delta, &b.last_delta, sizeof(double)) != 0) {
-        *why = "Delta " + double_str(a.last_delta) + " vs " + double_str(b.last_delta);
-        return false;
-    }
-    if (a.assignments.size() != b.assignments.size() || a.counts.size() != b.counts.size() ||
-        a.centroids.size() != b.centroids.size()) {
-        *why = "result array sizes differ";
-        return false;
-    }
-    for (size_t i = 0; i < a.assignments.size(); ++i) {
-        if (a.assignments[i] != b.assignments[i]) {
-            *why = "assignment of point " + std::to_string(i) + ": " +
-                   std::to_string(a.assignments[i]) + " vs " + std::to_string(b.assignments[i]);
-            return false;
-        }
-    }
-    for (size_t k = 0; k < a.counts.size(); ++k) {
-        if (a.counts[k] != b.counts[k]) {
-            *why = "count of cluster " + std::to_string(k) + ": " + std::to_string(a.counts[k]) +
-                   " vs " + std::to_string(b.counts[k]);
-            return false;
-        }
-    }
-    for (size_t e = 0; e < a.centroids.size(); ++e) {
-        // Bitwise: -0.0 and 0.0 would compare equal with ==, and the kernels must not even
-        // differ in the sign of a zero.
-        if (std::memcmp(&a.centroids[e], &b.centroids[e], sizeof(float)) != 0) {
-            *why = "centroid element " + std::to_string(e) + ": " + float_str(a.centroids[e]) +
-                   " vs " + float_str(b.centroids[e]);
-            return false;
-        }
-    }
-    return true;
-}
-
 // One (dataset, parameters) pair run with both assign kernels and compared. Returns false when
 // either run failed on the device, so the caller can keep counting configurations honestly.
 bool compare_assign_kernels(const float *X, const float *C0, const Config &base, double m_range,
@@ -917,7 +606,7 @@ bool compare_assign_kernels(const float *X, const float *C0, const Config &base,
     }
 
     std::string why;
-    check(results_identical(baseline, smem, &why),
+    check(tests::results_bit_equal(baseline, smem, &why),
           tag + ": assign_smem differs from assign (" + why + ")");
     return true;
 }
@@ -1193,11 +882,5 @@ int main(int argc, char **argv)
         }
     }
 
-    std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
-    if (g_failures != 0) {
-        std::printf("RESULT: FAILED\n");
-        return 1;
-    }
-    std::printf("RESULT: all GPU-level tests in this run passed\n");
-    return 0;
+    return tests::report_totals("all GPU-level tests in this run passed");
 }

@@ -102,6 +102,12 @@ except Exception:
 if RUN_VERSION == "git:":
     RUN_VERSION = "unknown"
 
+# PERF-008: the executables record the build identity in their JSON summary and CSV rows, and
+# neither the source revision nor the compiler flags are knowable from inside the compiler, so
+# they are passed through the environment rather than invented by the program.
+os.environ["KMEANS_RUN_VERSION"] = RUN_VERSION
+os.environ["KMEANS_BUILD_FLAGS"] = " ".join(NVCC_RELEASE_FLAGS + NVCC_HOST_FP_FLAGS)
+
 ENV["drive_status"] = DRIVE_STATUS          # BLD-001c: unpersisted results stay identifiable
 ENV["quick"] = QUICK                        # which sections this run actually executed
 ENV["work_dir"] = WORK_DIR

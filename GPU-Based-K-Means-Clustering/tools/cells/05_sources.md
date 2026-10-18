@@ -12,11 +12,14 @@ The host side, in the ARC order of §18.2:
 | `common.h` | ARC-01 | `Status` (§2.7), exit codes (BLD-005), message format (BLD-006), the NUM-005/NUM-006 tolerances, and overflow-checked size arithmetic with the MEM-002 capacity model (CUDA-006) |
 | `validate.h/.cpp` | ARC-01 | VAL-001…VAL-010, including the VAL-007 range bound $4DM^2 \le 2^{126}$ that guarantees no binary32 distance can overflow during the run |
 | `io_kmd.h/.cpp` | ARC-02 | the `.kmd`/`.kma` binary formats of BLD-004, with the FR-002 exact-size check |
-| `cpu_reference.h/.cpp` | ARC-03 | the oracle of NUM-003: the FP32 distance path of §2.2, a binary64 path for near-tie margins, binary64 sums, the tie rule, empty-cluster retention, the convergence loop and finalization. The step functions are exposed individually for the §10.3 lockstep verification added in M5 |
+| `cpu_reference.h/.cpp` | ARC-03 | the oracle of NUM-003: the FP32 distance path of §2.2, a binary64 path for near-tie margins, binary64 sums, the tie rule, empty-cluster retention, the convergence loop and finalization. The step functions are exposed individually because the §10.3 lockstep verification feeds the device's own state into each one and compares the result |
 | `gen.h/.cpp`, `gen_main.cpp` | ARC-02 | the FR-003 generator and the `kmeans-gen` CLI of BLD-003a |
-| `hand_data.h`, `test_cpu.cpp` | ARC-12 | H1–H6 and H2-a…e with their §16.0 expected outcomes, plus TEST-U08, U09, U11, U12 and U13 at CPU level |
+| `lockstep.h/.cpp` | ARC-03/ARC-12 | the §10.3 comparison: one iteration of device state judged kernel by kernel against the CPU reference. Shared by the test driver (TEST-I10) and by `--verify lockstep` (FR-019), so a failure in either means the same thing |
+| `cli_options.h/.cpp` | ARC-11 | the BLD-003a command line. Parsing is where a program of this shape is easiest to get wrong and hardest to debug on a remote runtime, so it is a separate, CUDA-free unit with its own tests |
+| `report.h/.cpp` | ARC-11 | the FR-015 run summary as JSON (BLD-004) and the §13.1 raw CSV row, from one record, so TEST-I08 can compare both against the values the program printed. Also the PERF-006 statistics |
+| `hand_data.h`, `test_harness.h`, `test_cpu.cpp` | ARC-12 | H1–H6 and H2-a…e with their §16.0 expected outcomes; the check/report scaffolding shared by the three drivers; and TEST-U08, U09, U11, U12, U13, TEST-I08 and the BLD-003a command line at CPU level |
 
-The device side, added in M2, M3 and M4:
+The device side, added in M2 to M5:
 
 | File | Component | Responsibility |
 |---|---|---|
@@ -25,7 +28,8 @@ The device side, added in M2, M3 and M4:
 | `device_context.cuh` | ARC-04 | CUDA-001 device query and the compute-capability 6.0 gate, the shared-memory limit checks, the `G` selection against real free memory, and VAL-009 — all before the first allocation, so EDGE-26 fails with exit code 3 and a byte count instead of a CUDA out-of-memory error |
 | `kernels.cuh/.cu` | ARC-05/06/07/08 | the CUDA-002 kernel set: `assign` and `assign_smem` (§8), `accum_atomic` (§6), `reduce_stage1` and `reduce_stage2` (§7), `update`, `movement`, `max_reduce`. Thread mapping, ownership and synchronization are documented at each kernel and summarised in the three contract notes above |
 | `kmeans_gpu.h/.cu` | ARC-09/ARC-10 | the §2.7 loop in the CUDA-003 launch order, §2.8 finalization, the PERF-005 timings, the §10.3 lockstep hook and the FR-019 `final` verification. Only the accumulation step differs between the two strategies (FR-018) |
-| `test_gpu.cu` | ARC-12 | TEST-I01…I07, I10, U01, U03…U07, E16 and SMEM-004 on the device, with `--only` and `--quick` so the notebook can run the sections separately |
+| `kmeans_main.cu` | ARC-11 | the `kmeans` executable: the order of operations, and nothing else. Load (FR-002), then every VAL rule, then the device query and VAL-010, then the run — so an invalid configuration exits with a parameter name or a byte count instead of a CUDA error (FR-001) |
+| `test_device.cuh`, `test_gpu.cu`, `test_edge.cu` | ARC-12 | the device-side scaffolding; TEST-I01…I07, I10, U01, U03…U07, E16 and SMEM-004; and the §9.2 corner cases with TEST-U02, I09, I11, R01 and R02. Both drivers take `--only` and `--quick` so the notebook can run the sections separately |
 
-Still to come: the `kmeans` CLI executable and its `.kma`/`.kmd`/JSON outputs (FR-015, BLD-003a)
-with the full test suite and the sanitizer suite in M5, and the benchmark harness in M6.
+Still to come: the benchmark harness and the analysis cells (M6, §13), and the traceability
+matrix update (M7, §17).

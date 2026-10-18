@@ -1,7 +1,10 @@
 ### 8. Kernel checks: lockstep against the CPU reference, and buffer initialization
 
-This section grows into the full TEST-B02 suite in M5. At M2–M3 it carries the two checks that
-judge the kernels on realistic data rather than on four hand-computed points:
+The first of three test sections. This one carries the two checks that judge the kernels on
+realistic data rather than on four hand-computed points; SMEM-004 follows, and the full TEST-B02
+suite — which re-runs both of these plus everything else §16.1–§16.5 asks for — is the cell after
+that. The order is deliberate: each section is cheaper than the next, so a broken kernel is named
+by the cheapest check that can see it.
 
 **TEST-U06 — buffer initialization (MEM-006).** `P`, `Q`, `S` and `n` are filled with `0xFF` bytes
 before the run, which is a quiet NaN as binary64 and `0xFFFFFFFF` as uint32. A correct Approach B

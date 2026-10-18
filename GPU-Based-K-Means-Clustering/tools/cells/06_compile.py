@@ -6,7 +6,11 @@ if "GXX_REFERENCE_FLAGS" not in globals():
 
 # One source of truth: section 3 owns -O2 -std=c++17 -ffp-contract=off (NUM-003, BLD-002).
 GXX_FLAGS = GXX_REFERENCE_FLAGS + ["-Wall", "-Wextra"]
-CPU_LIB_SOURCES = ["validate.cpp", "io_kmd.cpp", "cpu_reference.cpp", "gen.cpp"]
+# Every host-only translation unit. The CLI parser (cli_options.cpp), the FR-015/§13.1 reporting
+# (report.cpp) and the §10.3 lockstep comparison (lockstep.cpp) are deliberately free of CUDA, so
+# they are built and tested here by g++ as well as linked into the CUDA binaries below.
+CPU_LIB_SOURCES = ["validate.cpp", "io_kmd.cpp", "cpu_reference.cpp", "gen.cpp",
+                   "cli_options.cpp", "report.cpp", "lockstep.cpp"]
 
 
 def compile_host(output, sources):

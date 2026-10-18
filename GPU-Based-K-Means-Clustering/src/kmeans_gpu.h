@@ -18,6 +18,7 @@
 
 #include "common.h"
 #include "device_context.cuh"
+#include "lockstep.h"
 
 namespace kmeans {
 namespace gpu {
@@ -66,19 +67,11 @@ struct RunInfo {
     double max_centroid_difference = 0.0;  // worst |C_final - M| from the P2 check (section 2.8)
 };
 
-// One iteration of device state, handed to the lockstep checker (section 10.3 item 1). The
-// snapshot is taken while A(t) still exists, before the assignment pass overwrites it in place.
-struct LockstepSnapshot {
-    int64_t iteration = 0;              // t before this update, so the update produces C(t+1)
-    std::vector<int32_t> a_in;          // A(t), the input of the accumulation
-    std::vector<float> c_in;            // C(t)
-    std::vector<uint32_t> counts;       // device n from the accumulation
-    std::vector<double> sums;           // device S from the accumulation
-    std::vector<float> c_out;           // C(t+1) from the device update
-    std::vector<int32_t> a_out;         // A(t+1) from the device assignment pass
-    double delta = 0.0;                 // device Delta
-    int64_t changed = 0;                // device change count
-};
+// The snapshot record and the comparison that judges it live in lockstep.h, free of CUDA, so the
+// §10.3 logic is shared by the test driver and the `--verify lockstep` mode of the executable and
+// is compiled without a GPU. The alias keeps `gpu::LockstepSnapshot` readable at the call sites,
+// where the snapshot is unambiguously device state.
+using kmeans::LockstepSnapshot;
 
 using LockstepHook = std::function<void(const LockstepSnapshot &)>;
 

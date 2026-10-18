@@ -15,67 +15,26 @@
 #include <string>
 #include <vector>
 
+#include "cli_options.h"
 #include "common.h"
 #include "cpu_reference.h"
 #include "gen.h"
 #include "hand_data.h"
 #include "io_kmd.h"
 #include "launch_config.h"
+#include "report.h"
+#include "test_harness.h"
 #include "validate.h"
 
 using namespace kmeans;
 
 namespace {
 
-int g_checks = 0;
-int g_failures = 0;
-int g_case_failures = 0;
-
-void check(bool condition, const std::string &what)
-{
-    ++g_checks;
-    if (!condition) {
-        ++g_failures;
-        ++g_case_failures;
-        std::printf("      FAIL  %s\n", what.c_str());
-    }
-}
-
-void check_eq_i64(int64_t got, int64_t want, const std::string &what)
-{
-    check(got == want, what + ": got " + std::to_string(got) + ", want " + std::to_string(want));
-}
-
-std::string float_str(float v)
-{
-    char buf[48];
-    std::snprintf(buf, sizeof(buf), "%.9g", static_cast<double>(v));
-    return std::string(buf);
-}
-
-std::string double_str(double v)
-{
-    char buf[48];
-    std::snprintf(buf, sizeof(buf), "%.17g", v);
-    return std::string(buf);
-}
-
-// Scope guard for the per-test PASS/FAIL line.
-class TestScope {
-public:
-    TestScope(const char *id, const std::string &title) : id_(id)
-    {
-        g_case_failures = 0;
-        std::printf("  %-7s %s\n", id, title.c_str());
-    }
-    ~TestScope()
-    {
-        std::printf("      %s\n", g_case_failures == 0 ? "PASS" : "-> FAILED");
-    }
-
-private:
-    const char *id_;
-};
+using kmeans::tests::check;
+using kmeans::tests::check_eq_i64;
+using kmeans::tests::double_str;
+using kmeans::tests::float_str;
+using kmeans::tests::TestScope;
 
 // --- §16.0 hand datasets -----------------------------------------------------------------------
 
@@ -899,12 +858,375 @@ void test_launch_geometry()
     }
 }
 
+// --- BLD-003a: the command line of the kmeans executable ---------------------------------------
+//
+// The CLI is the one part of the program a user drives directly, and a parser that quietly accepts
+// a typo produces a plausible-looking result for a configuration nobody asked for. These cases run
+// here, with g++ and no GPU, because parse_cli is deliberately free of CUDA (cli_options.h).
+
+std::vector<const char *> argv_of(const std::vector<std::string> &args)
+{
+    static std::vector<std::string> storage;  // the pointers must outlive the call
+    storage = args;
+    std::vector<const char *> out;
+    out.reserve(storage.size());
+    for (const std::string &arg : storage) {
+        out.push_back(arg.c_str());
+    }
+    return out;
+}
+
+// The minimal accepted command line; individual cases add to it or replace parts of it.
+std::vector<std::string> base_args()
+{
+    return {"kmeans",     "--data",      "X.kmd", "--centroids", "C0.kmd", "--k",
+            "8",          "--max-iter",  "20",    "--tol",       "0.001",  "--strategy",
+            "reduction"};
+}
+
+CliParse parse_args(const std::vector<std::string> &args, CliOptions *out)
+{
+    const std::vector<const char *> argv = argv_of(args);
+    return parse_cli(static_cast<int>(argv.size()), argv.data(), out);
+}
+
+void test_cli_options()
+{
+    {
+        TestScope scope("CLI", "BLD-003a: the documented command line is accepted in full");
+        std::vector<std::string> args = base_args();
+        for (const char *extra : {"--assign", "smem", "--block-size", "512", "--reduce-chunks",
+                                  "64", "--fixed-iters", "--verify", "final", "--out-prefix",
+                                  "out/run1", "--reps", "10", "--warmup", "3", "--csv",
+                                  "bench_raw.csv"}) {
+            args.push_back(extra);
+        }
+        CliOptions o;
+        const CliParse p = parse_args(args, &o);
+        check(p.ok, "accepted: " + p.rule + " " + p.message);
+        check_eq_i64(o.K, 8, "--k");
+        check_eq_i64(o.max_iter, 20, "--max-iter");
+        check(o.tol == 0.001, "--tol: got " + double_str(o.tol));
+        check(o.strategy == Strategy::kReduction, "--strategy reduction");
+        check(o.assign_kernel == AssignKernel::kSharedMemory, "--assign smem");
+        check_eq_i64(o.block_size, 512, "--block-size");
+        check_eq_i64(o.reduce_chunks, 64, "--reduce-chunks");
+        check(o.fixed_iters, "--fixed-iters");
+        check(o.verify == VerifyMode::kFinal, "--verify final");
+        check(o.out_prefix == "out/run1", "--out-prefix");
+        check_eq_i64(o.reps, 10, "--reps");
+        check_eq_i64(o.warmup, 3, "--warmup");
+        check(o.csv_path == "bench_raw.csv", "--csv");
+        check(!o.profile_phases, "--profile-phases defaults to off");
+    }
+
+    {
+        TestScope scope("CLI", "defaults: block size 256, automatic G, no verification");
+        CliOptions o;
+        const CliParse p = parse_args(base_args(), &o);
+        check(p.ok, "the minimal command line is accepted");
+        check_eq_i64(o.block_size, 256, "CUDA-007 default block size");
+        check_eq_i64(o.reduce_chunks, 0, "RED-006: 0 means choose G automatically");
+        check(o.verify == VerifyMode::kNone, "--verify defaults to none");
+        check(o.assign_kernel == AssignKernel::kBaseline, "--assign defaults to baseline");
+        check_eq_i64(o.warmup, 3, "PERF-006 default warm-up count");
+        check_eq_i64(o.reps, 0, "no repetition series without --reps");
+        check(o.out_prefix.empty(), "no outputs are written without --out-prefix");
+    }
+
+    {
+        TestScope scope("CLI", "every required option is required (BLD-003a)");
+        const char *required[] = {"--data", "--centroids", "--k", "--max-iter", "--tol",
+                                  "--strategy"};
+        for (const char *name : required) {
+            std::vector<std::string> args;
+            const std::vector<std::string> full = base_args();
+            for (size_t i = 0; i < full.size(); ++i) {
+                if (full[i] == name) {
+                    ++i;  // skip the value too
+                    continue;
+                }
+                args.push_back(full[i]);
+            }
+            CliOptions o;
+            const CliParse p = parse_args(args, &o);
+            check(!p.ok, std::string("omitting ") + name + " is rejected");
+            check_eq_i64(p.exit_code, kExitInvalidInput,
+                         std::string("omitting ") + name + ": exit code");
+        }
+    }
+
+    {
+        TestScope scope("CLI", "malformed values are rejected with exit code 2 (BLD-005)");
+        struct Case {
+            const char *option;
+            const char *value;
+            const char *why;
+        };
+        const Case cases[] = {
+            {"--k", "eight", "a non-numeric K"},
+            {"--k", "8x", "trailing characters after K"},
+            {"--max-iter", "", "an empty iteration limit"},
+            {"--tol", "abc", "an unparsable tolerance (VAL-005, the unparsable half)"},
+            {"--strategy", "atomics", "a misspelled strategy"},
+            {"--assign", "shared", "an unknown assignment kernel"},
+            {"--verify", "all", "an unknown verification mode"},
+            {"--block-size", "-32", "a negative block size"},
+            {"--reduce-chunks", "1.5", "a non-integer G"},
+            {"--reps", "0", "zero repetitions"},
+            {"--warmup", "-1", "a negative warm-up count"},
+        };
+        for (const Case &c : cases) {
+            std::vector<std::string> args = base_args();
+            args.push_back(c.option);
+            args.push_back(c.value);
+            CliOptions o;
+            const CliParse p = parse_args(args, &o);
+            check(!p.ok, std::string(c.why) + " is rejected");
+            check_eq_i64(p.exit_code, kExitInvalidInput, std::string(c.why) + ": exit code");
+            check(!p.rule.empty(), std::string(c.why) + ": the message names a rule");
+        }
+
+        // An unknown option, a bare argument, and an option with no value.
+        for (const std::vector<std::string> &extra :
+             std::vector<std::vector<std::string>>{{"--threads", "8"}, {"positional"}, {"--k"}}) {
+            std::vector<std::string> args = base_args();
+            for (const std::string &a : extra) {
+                args.push_back(a);
+            }
+            CliOptions o;
+            const CliParse p = parse_args(args, &o);
+            check(!p.ok, "'" + extra[0] + "' is rejected");
+            check_eq_i64(p.exit_code, kExitInvalidInput, "'" + extra[0] + "': exit code");
+        }
+    }
+
+    {
+        TestScope scope("CLI", "--tol nan and --tol -1 reach VAL-005, not the parser");
+        // strtod parses both, so the parser must let them through and validate_parameters must be
+        // the single place that applies VAL-005. Two rules in two places would eventually disagree.
+        for (const char *value : {"nan", "-1", "inf"}) {
+            std::vector<std::string> args = base_args();
+            args[10] = value;  // the --tol value in base_args
+            CliOptions o;
+            const CliParse p = parse_args(args, &o);
+            check(p.ok, std::string("--tol ") + value + " parses");
+            if (!p.ok) {
+                continue;
+            }
+            const Validation v = validate_parameters(100, 4, o.K, o.max_iter, o.tol);
+            check(!v.ok, std::string("--tol ") + value + " is rejected by VAL-005");
+            check(v.rule == "VAL-005", std::string("--tol ") + value + ": rule is VAL-005, got " +
+                                           v.rule);
+            check_eq_i64(v.exit_code, kExitInvalidInput,
+                         std::string("--tol ") + value + ": exit code");
+        }
+    }
+
+    {
+        TestScope scope("CLI", "combinations that cannot mean anything are rejected");
+        std::vector<std::string> args = base_args();
+        args.push_back("--csv");
+        args.push_back("bench.csv");
+        CliOptions o;
+        CliParse p = parse_args(args, &o);
+        check(!p.ok, "--csv without --reps is rejected: a raw row is one measured repetition");
+
+        args = base_args();
+        for (const char *extra : {"--reps", "10", "--verify", "lockstep"}) {
+            args.push_back(extra);
+        }
+        p = parse_args(args, &o);
+        check(!p.ok, "--reps with --verify lockstep is rejected (FR-019: never a sample)");
+    }
+
+    {
+        TestScope scope("CLI", "--help prints usage and is not an error");
+        CliOptions o;
+        const CliParse p = parse_args({"kmeans", "--help"}, &o);
+        check(p.usage, "--help requests the usage text");
+        check(p.ok, "--help is not a parse failure");
+        check(cli_usage().find("--strategy {atomic|reduction}") != std::string::npos,
+              "the usage text shows the BLD-003a command line");
+    }
+}
+
+// --- TEST-I08: the FR-015 summary and the section 13.1 CSV row ---------------------------------
+
+RunReport sample_report()
+{
+    RunReport r;
+    r.env.gpu_name = "Tesla T4";
+    r.env.compute_capability = "7.5";
+    r.env.sm_count = 40;
+    r.env.driver_version = 13000;
+    r.env.cuda_runtime = 13000;
+    r.env.nvcc_version = "13.0.88";
+    r.env.host_compiler = "13.3.0";
+    r.env.os = "Linux";
+    r.env.build_flags = "-O3 -arch=sm_75";
+    r.env.git_commit = "abc1234";
+    r.timestamp_utc = "2026-10-18T07:00:00Z";
+    r.dataset_id = "n1000_d4_k3";
+    r.data_path = "data/n1000_d4_k3_X.kmd";
+    r.centroids_path = "data/n1000_d4_k3_C0.kmd";
+    r.config.N = 1000;
+    r.config.D = 4;
+    r.config.K = 3;
+    r.config.max_iter = 20;
+    r.config.tol = 0.001;
+    r.config.strategy = Strategy::kReduction;
+    r.config.assign_kernel = AssignKernel::kSharedMemory;
+    r.config.block_size = 256;
+    r.tile_k = 8;
+    r.tile_d = 32;
+    r.reduce_chunks_g = 512;
+    r.verify = VerifyMode::kFinal;
+    r.rep_index = 3;
+    r.iterations = 7;
+    r.status = Status::CONVERGED_ASSIGNMENTS;
+    r.centroid_consistent = true;
+    r.last_delta = 0.5;
+    r.has_last_delta = true;
+    r.t_alg_ms = 12.5;
+    r.t_e2e_ms = 20.25;
+    r.objective = 1234.5;
+    r.correctness_status = "PASS";
+    r.counts = {400, 350, 250};
+    r.run_id = make_run_id(r);
+    return r;
+}
+
+void test_i08_reporting()
+{
+    {
+        TestScope scope("I08", "the FR-015 summary carries every field the requirement names");
+        const RunReport r = sample_report();
+        const std::string json = summary_json(r);
+        const char *required[] = {
+            "\"status\": \"CONVERGED_ASSIGNMENTS\"", "\"iterations\": 7",
+            "\"centroid_consistent\": true",         "\"assignment_consistent\": true",
+            "\"last_delta\": 0.5",                   "\"strategy\": \"reduction\"",
+            "\"assign_kernel\": \"smem\"",           "\"configuration\"",
+            "\"t_alg\": 12.5",                       "\"t_e2e\": 20.25",
+            "\"environment\"",                       "\"gpu_name\": \"Tesla T4\"",
+            "\"counts\": [400, 350, 250]",           "\"correctness_status\": \"PASS\"",
+            "\"reduce_chunks_G\": 512",              "\"tile_k\": 8",
+        };
+        for (const char *field : required) {
+            check(json.find(field) != std::string::npos,
+                  std::string("the summary contains ") + field);
+        }
+        // Balanced braces and brackets are a cheap proxy for "numpy/json can parse it", which the
+        // notebook cell checks for real.
+        int braces = 0, brackets = 0;
+        for (char c : json) {
+            braces += (c == '{') - (c == '}');
+            brackets += (c == '[') - (c == ']');
+        }
+        check_eq_i64(braces, 0, "braces balance");
+        check_eq_i64(brackets, 0, "brackets balance");
+    }
+
+    {
+        TestScope scope("I08", "FR-015: Delta is null, not zero, when no update was performed");
+        RunReport r = sample_report();
+        r.iterations = 0;
+        r.has_last_delta = false;
+        const std::string json = summary_json(r);
+        check(json.find("\"last_delta\": null") != std::string::npos,
+              "t = 0 reports null rather than 0.0, which would be a different claim");
+    }
+
+    {
+        TestScope scope("I08", "section 13.1: the CSV row has one field per header column");
+        const RunReport r = sample_report();
+        const std::string header = csv_header();
+        const std::string row = csv_row(r);
+        const auto count_fields = [](const std::string &line) {
+            int64_t fields = 1;
+            bool quoted = false;
+            for (char c : line) {
+                if (c == '"') {
+                    quoted = !quoted;
+                } else if (c == ',' && !quoted) {
+                    ++fields;
+                } else if (c == '\n') {
+                    break;
+                }
+            }
+            return fields;
+        };
+        check_eq_i64(count_fields(row), count_fields(header),
+                     "the row has as many fields as the header has columns");
+        check(row.find("reduction,smem,fp64,") != std::string::npos,
+              "the strategy, kernel and precision columns: " + row.substr(0, 200));
+        check(row.find(",CONVERGED_ASSIGNMENTS,") != std::string::npos, "the status column");
+        check(row.find(",NA,NA,NA,NA,") != std::string::npos,
+              "the four PERF-007 phase columns are NA outside phase-timing mode");
+    }
+
+    {
+        TestScope scope("I08", "columns that describe nothing are NA, not zero");
+        RunReport r = sample_report();
+        r.config.strategy = Strategy::kAtomic;
+        r.config.assign_kernel = AssignKernel::kBaseline;
+        r.reduce_chunks_g = 0;  // Approach A allocates no partial buffers
+        const std::string row = csv_row(r);
+        check(row.find("atomic,baseline,fp64,256,NA,NA,NA,") != std::string::npos,
+              "the tile and G columns are NA for Approach A with the baseline kernel: " +
+                  row.substr(0, 220));
+        const std::string json = summary_json(r);
+        check(json.find("\"reduce_chunks_G\": null") != std::string::npos,
+              "and null in the JSON summary, where 0 would be a wrong number");
+    }
+
+    {
+        TestScope scope("I08", "a field containing a comma survives the round trip");
+        RunReport r = sample_report();
+        r.env.build_flags = "-O3,-lineinfo,\"quoted\"";
+        const std::string row = csv_row(r);
+        check(row.find("\"-O3,-lineinfo,\"\"quoted\"\"\"") != std::string::npos,
+              "the field is quoted and embedded quotes are doubled: " + row);
+    }
+
+    {
+        TestScope scope("I08", "PERF-006 statistics over the measured repetitions");
+        const Statistics s = statistics({4.0, 1.0, 3.0, 2.0});
+        check_eq_i64(s.count, 4, "count");
+        check(s.min == 1.0 && s.max == 4.0, "min and max");
+        check(s.mean == 2.5, "mean: got " + double_str(s.mean));
+        check(s.median == 2.5, "median of an even count is the midpoint of the two middles");
+        // Sample standard deviation of {1,2,3,4}: sqrt(5/3).
+        check(std::fabs(s.stddev - std::sqrt(5.0 / 3.0)) < 1e-12,
+              "sample standard deviation: got " + double_str(s.stddev));
+        check(std::fabs(s.cv - s.stddev / s.mean) < 1e-15, "the coefficient of variation");
+
+        const Statistics odd = statistics({10.0, 30.0, 20.0});
+        check(odd.median == 20.0, "median of an odd count is the middle value");
+        const Statistics one = statistics({7.0});
+        check(one.stddev == 0.0, "a single sample has no spread, not a division by zero");
+        const Statistics none = statistics({});
+        check_eq_i64(none.count, 0, "no samples reports no samples");
+    }
+
+    {
+        TestScope scope("I08", "the dataset id is recovered from the data file name (FR-003)");
+        check(dataset_id_from_path("/content/kmeans/data/n1000_d4_k3_seed7-abcd_X.kmd") ==
+                  "n1000_d4_k3_seed7-abcd",
+              "directory, extension and the generator's _X suffix are stripped");
+        check(dataset_id_from_path("X.kmd") == "X", "a bare file name");
+        check(dataset_id_from_path("") == "unknown", "an empty path is reported as unknown");
+    }
+}
+
 }  // namespace
 
 int main()
 {
-    std::printf("M1-M3 CPU test suite (requirements.md §16.0, §16.3, TEST-U08/U09/U11/U12/U13,\n"
-                "plus the host-side launch geometry of CUDA-007, RED-006 and DEC-001)\n\n");
+    std::printf("M1-M5 CPU test suite (requirements.md §16.0, §16.3, TEST-U08/U09/U11/U12/U13,\n"
+                "TEST-I08, the BLD-003a command line, and the host-side launch geometry of\n"
+                "CUDA-007, RED-006 and DEC-001)\n\n");
 
     test_hand_cases();
     std::printf("\n");
@@ -916,12 +1238,8 @@ int main()
     test_u13_generator();
     test_distance_paths_agree();
     test_end_to_end_blobs();
+    test_cli_options();
+    test_i08_reporting();
 
-    std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
-    if (g_failures != 0) {
-        std::printf("RESULT: FAILED\n");
-        return 1;
-    }
-    std::printf("RESULT: all CPU-level tests passed\n");
-    return 0;
+    return tests::report_totals("all CPU-level tests passed");
 }

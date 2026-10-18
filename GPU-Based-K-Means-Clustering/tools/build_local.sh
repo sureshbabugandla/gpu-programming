@@ -42,7 +42,18 @@ echo "g++: $(g++ --version | head -1)"
 echo "flags: ${CXXFLAGS[*]} ${LINKFLAGS[*]:-}"
 echo
 
-LIB_SOURCES=(src/validate.cpp src/io_kmd.cpp src/cpu_reference.cpp src/gen.cpp)
+# Every host-only translation unit of the project. Keeping the CLI parser, the FR-015/§13.1
+# reporting and the §10.3 lockstep comparison free of CUDA is what lets them be built and tested
+# here rather than first on Colab.
+LIB_SOURCES=(
+    src/validate.cpp
+    src/io_kmd.cpp
+    src/cpu_reference.cpp
+    src/gen.cpp
+    src/cli_options.cpp
+    src/report.cpp
+    src/lockstep.cpp
+)
 
 echo "building kmeans-gen"
 g++ "${CXXFLAGS[@]}" "${LINKFLAGS[@]:-}" -I src src/gen_main.cpp src/gen.cpp src/io_kmd.cpp \
