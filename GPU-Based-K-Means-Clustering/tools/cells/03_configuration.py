@@ -7,6 +7,12 @@ USE_DRIVE = True  # BLD-001c: persist results to Drive; falls back to local disk
 DRIVE_RESULTS_DIR = "/content/drive/MyDrive/kmeans_cuda"
 BUILD_DIR = "/content/kmeans"  # always local: see the note on exec permissions below
 
+# QUICK keeps a development run to the compile, hand-dataset and lockstep cells: the checks that
+# decide whether the kernels are correct at all. It drops the longer sweeps (the G sweep, partial
+# Stage 2 tiles and the non-aligned size matrix) and, from M5/M6, the sanitizer and benchmark
+# sections. Set it to False for a run that produces submission evidence (BLD-007).
+QUICK = True
+
 if "ENV" not in globals():
     raise RuntimeError("Run the environment cell (section 2) first: ENV is not defined.")
 
@@ -97,6 +103,7 @@ if RUN_VERSION == "git:":
     RUN_VERSION = "unknown"
 
 ENV["drive_status"] = DRIVE_STATUS          # BLD-001c: unpersisted results stay identifiable
+ENV["quick"] = QUICK                        # which sections this run actually executed
 ENV["work_dir"] = WORK_DIR
 ENV["results_root"] = RESULTS_ROOT
 ENV["sm_arch"] = SM_ARCH
@@ -107,6 +114,7 @@ print(f"GPU             : {ENV['gpu']['name']} (compute capability {COMPUTE_CAP}
 print(f"SM_ARCH         : {SM_ARCH}   [derived from ENV-01, BLD-001c]")
 print(f"CUDA toolkit    : {CUDA_TOOLKIT} (as reported by nvcc)")
 print(f"Drive           : {DRIVE_STATUS}")
+print(f"QUICK           : {QUICK}   [True = compile, hand datasets and lockstep only]")
 print(f"build dir (cwd) : {WORK_DIR}   [local: Drive mounts are not executable]")
 print(f"results root    : {RESULTS_ROOT}")
 print(f"data / out / csv: {DATA_DIR} | {OUT_DIR} | {CSV_DIR}")

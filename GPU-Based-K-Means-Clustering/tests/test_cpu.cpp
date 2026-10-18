@@ -20,6 +20,7 @@
 #include "gen.h"
 #include "hand_data.h"
 #include "io_kmd.h"
+#include "launch_config.h"
 #include "validate.h"
 
 using namespace kmeans;
@@ -731,17 +732,171 @@ void test_end_to_end_blobs()
     check(std::isfinite(r.objective), "the objective J is finite");
 }
 
+// --- launch geometry and the choice of G (CUDA-007, RED-006, MEM-003, DEC-001) -----------------
+//
+// src/launch_config.h is deliberately free of CUDA constructs so that all of this arithmetic --
+// which decides how much memory Approach B allocates and in what order it sums -- is testable
+// without a GPU. The kernels use the identical expressions.
+
+void test_launch_geometry()
+{
+    {
+        TestScope scope("U11", "CUDA-007 grid sizing");
+        // grid = min(ceil(work / block), 32 * SM count). With 40 SMs the cap is 1280.
+        check_eq_i64(grid_size(1000000, 256, 40), 1280, "large work is capped at 32 * SMs");
+        check_eq_i64(grid_size(1000, 256, 40), 4, "small work uses ceil(work / block)");
+        check_eq_i64(grid_size(256, 256, 40), 1, "exactly one block of work");
+        check_eq_i64(grid_size(257, 256, 40), 2, "one element past a block rounds up");
+        check_eq_i64(grid_size(1, 256, 40), 1, "a single element still launches one block");
+        check_eq_i64(grid_size(0, 256, 40), 1,
+                     "zero work launches one block, which the bounds checks make a no-op");
+
+        // The movement grid is capped at 1024 so max_reduce fits in one block and the cap matches
+        // the movement_blocks default of device_memory_bytes.
+        check_eq_i64(movement_grid_size(100000000, 256, 40), kMaxMovementBlocks,
+                     "the movement grid is capped at 1024 blocks");
+        check_eq_i64(movement_grid_size(512, 256, 40), 2, "small K is not affected by the cap");
+    }
+
+    {
+        TestScope scope("U11", "MEM-004 / SMEM-003 shared-memory footprints");
+        // Against the 48 KiB per-block default of ENV-01.
+        const int64_t limit = 49152;
+        check_eq_i64(stage2_shared_bytes(), 8 * 8 * 32 + 4 * 8, "reduce_stage2 needs 2080 B");
+        check(stage2_shared_bytes() <= limit, "reduce_stage2 fits the 48 KiB limit");
+        check_eq_i64(assign_smem_bytes(kAssignTileK, kAssignTileD), 1024,
+                     "assign_smem needs 1 KiB at T_K = 8, T_D = 32");
+        check(assign_smem_bytes(16, 32) <= limit, "the largest tile sweep configuration fits");
+        check_eq_i64(block_reduction_bytes(1024), 8192,
+                     "a 1024-thread block reduction needs 8 KiB");
+        check(block_reduction_bytes(1024) <= limit, "the largest block reduction fits");
+    }
+
+    {
+        TestScope scope("U11", "Stage 2 tile geometry (RED-003)");
+        check_eq_i64(stage2_dim_tiles(1), 1, "D = 1 is one partial tile");
+        check_eq_i64(stage2_dim_tiles(32), 1, "D = 32 is exactly one tile");
+        check_eq_i64(stage2_dim_tiles(33), 2, "D = 33 needs a second, partial tile");
+        check_eq_i64(stage2_dim_tiles(65), 3, "D = 65 needs three tiles");
+        check_eq_i64(stage2_tiles(1024, 65), 1024 * 3, "K * T tiles in total");
+    }
+
+    {
+        TestScope scope("U11", "RED-006 choice of G");
+        // 40 SMs, so T_target = 81920. With D = 32 the target is ceil(81920/32) = 2560.
+        const uint64_t plenty = 16ull * 1024 * 1024 * 1024;
+        const ChunkSelection big =
+            choose_reduce_chunks(1000000, 32, 64, 40, plenty, 1024 * 1024, 0, 0);
+        check(big.ok, "a modest configuration selects a G");
+        check_eq_i64(big.g_target, 2560, "G_target = ceil(T_target / D)");
+        check_eq_i64(big.G, 2560, "memory is ample, so the target wins");
+        check_eq_i64(static_cast<int64_t>(big.bytes_per_chunk), 8 * 64 * 32 + 4 * 64,
+                     "8KD + 4K bytes per chunk");
+        check_eq_i64(static_cast<int64_t>(big.required_bytes),
+                     2560 * (8 * 64 * 32 + 4 * 64), "the reported byte count is 8GKD + 4GK");
+
+        // G <= N always, however large the target.
+        const ChunkSelection small_n =
+            choose_reduce_chunks(100, 32, 64, 40, plenty, 1024 * 1024, 0, 0);
+        check_eq_i64(small_n.G, 100, "G is clamped to N");
+
+        // A tight budget makes G_mem the binding constraint.
+        const uint64_t per_chunk = 8 * 64 * 32 + 4 * 64;
+        const ChunkSelection tight =
+            choose_reduce_chunks(1000000, 32, 64, 40, 4 * 100 * per_chunk, 0, 0, 0);
+        check(tight.ok, "a tight budget still selects a G");
+        check_eq_i64(tight.G, 100, "G_mem binds: floor(B_red / (8KD + 4K)) with B_red = free/4");
+        check_eq_i64(tight.g_memory, 100, "G_mem is reported");
+
+        // MEM-003: an explicit user cap overrides the quarter-of-free-memory rule.
+        const ChunkSelection capped =
+            choose_reduce_chunks(1000000, 32, 64, 40, plenty, 0, 10 * per_chunk, 0);
+        check_eq_i64(capped.G, 10, "the user cap on B_red binds");
+
+        // RED-007: no usable G at all fails, naming the bytes the run needs.
+        const ChunkSelection impossible =
+            choose_reduce_chunks(1000000, 32, 64, 40, per_chunk, 0, 0, 0);
+        check(!impossible.ok, "a budget below one chunk is rejected");
+        check(impossible.G == 0, "no G is reported when the selection fails");
+        check(impossible.required_bytes == per_chunk,
+              "the message reports the cost of a single chunk");
+        check(!impossible.message.empty(), "the failure carries a RED-007 explanation");
+
+        // The --reduce-chunks override is still bounded by N and by the budget.
+        const ChunkSelection override_ok =
+            choose_reduce_chunks(1000000, 32, 64, 40, plenty, 1024 * 1024, 0, 7);
+        check(override_ok.ok && override_ok.G == 7, "an override within the limits is honoured");
+        check(override_ok.user_override, "the override is recorded");
+        const ChunkSelection override_too_big =
+            choose_reduce_chunks(100, 32, 64, 40, plenty, 1024 * 1024, 0, 101);
+        check(!override_too_big.ok, "an override above N is rejected (DEC-001 requires G <= N)");
+        const ChunkSelection override_no_memory =
+            choose_reduce_chunks(1000000, 32, 64, 40, 4 * 10 * per_chunk, 0, 0, 1000);
+        check(!override_no_memory.ok, "an override past the budget is rejected, not silently used");
+
+        // Small D leans on a large G for Stage 1 parallelism (RED-008).
+        const ChunkSelection small_d =
+            choose_reduce_chunks(10000000, 1, 4, 40, plenty, 1024 * 1024, 0, 0);
+        check_eq_i64(small_d.g_target, 81920, "D = 1 gives G_target = T_target");
+    }
+
+    {
+        TestScope scope("U11", "DEC-001 chunk partition covers [0, N) exactly (RED-005)");
+        const int64_t sizes[][2] = {{1, 1},   {10, 1},   {10, 10}, {10, 3},  {100, 7},
+                                    {97, 13}, {1000, 1}, {7, 7},   {12345, 101}};
+        for (const auto &pair : sizes) {
+            const int64_t N = pair[0], G = pair[1];
+            const std::string tag = "N=" + std::to_string(N) + " G=" + std::to_string(G);
+            check(chunk_begin(0, N, G) == 0, tag + ": the first chunk starts at 0");
+            check(chunk_end(G - 1, N, G) == N, tag + ": the last chunk ends at N");
+            int64_t covered = 0;
+            bool contiguous = true;
+            for (int64_t g = 0; g < G; ++g) {
+                const int64_t begin = chunk_begin(g, N, G);
+                const int64_t end = chunk_end(g, N, G);
+                if (end < begin) {
+                    contiguous = false;
+                }
+                if (g > 0 && begin != chunk_end(g - 1, N, G)) {
+                    contiguous = false;  // a gap or an overlap between consecutive chunks
+                }
+                covered += end - begin;
+            }
+            check(contiguous, tag + ": consecutive chunks share endpoints");
+            check_eq_i64(covered, N, tag + ": the chunks cover exactly N points");
+            if (G <= N) {
+                bool all_non_empty = true;
+                for (int64_t g = 0; g < G; ++g) {
+                    if (chunk_end(g, N, G) <= chunk_begin(g, N, G)) {
+                        all_non_empty = false;
+                    }
+                }
+                check(all_non_empty, tag + ": G <= N means every chunk is non-empty");
+            }
+        }
+
+        // CUDA-006: the products stay inside int64 at the top of the valid range, where g*N is
+        // close to 2^62. A 32-bit intermediate would wrap and silently mis-partition the data.
+        const int64_t huge = 2147483647;  // 2^31 - 1, the VAL-002 limit
+        check(chunk_end(huge - 1, huge, huge) == huge,
+              "G = N at the VAL-002 limit still ends at N");
+        check(chunk_begin(huge / 2, huge, 2) >= 0, "no overflow at the top of the range");
+    }
+}
+
 }  // namespace
 
 int main()
 {
-    std::printf("M1 CPU test suite (requirements.md §16.0, §16.3, TEST-U08/U09/U11/U12/U13)\n\n");
+    std::printf("M1-M3 CPU test suite (requirements.md §16.0, §16.3, TEST-U08/U09/U11/U12/U13,\n"
+                "plus the host-side launch geometry of CUDA-007, RED-006 and DEC-001)\n\n");
 
     test_hand_cases();
     std::printf("\n");
     test_u08_movement();
     test_u09_empty_clusters();
     test_u11_size_calculator();
+    test_launch_geometry();
     test_u12_file_io();
     test_u13_generator();
     test_distance_paths_agree();
