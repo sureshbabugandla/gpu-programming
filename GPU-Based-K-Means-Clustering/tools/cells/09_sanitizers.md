@@ -30,6 +30,16 @@ run-to-run variation, and TEST-U05, where the result is checked across the whole
 This is stated here rather than left implicit, because a clean `racecheck` run is not by itself
 evidence of global race freedom (§16.4).
 
-Expected output: `0 errors` from each tool on each configuration, `0 bytes leaked` from
-`memcheck`, and a summary line at the end. The cell raises otherwise. It is skipped when
-`QUICK = True`.
+#### Reading the output
+
+The tools do not end the same way. `memcheck`, `initcheck` and `synccheck` close with
+`ERROR SUMMARY: N errors`, and `memcheck` adds `LEAK SUMMARY: N bytes leaked`. `racecheck` prints
+neither: it closes with `RACECHECK SUMMARY: N hazards displayed (E errors, W warnings)` and nothing
+else. The cell accepts both forms and requires every count it finds to be zero — a racecheck
+*warning* is a possible hazard the tool could not prove either way, so it is not something to pass
+over. If **neither** summary line appears the case fails regardless: no summary means the tool did
+not reach the end, and there is then nothing to conclude.
+
+Expected output: `0 errors` and `0 bytes leaked` from `memcheck`, `0 hazards, 0 errors,
+0 warnings` from `racecheck`, `0 errors` from `initcheck` and `synccheck`, and a clean summary at
+the end. The cell raises otherwise. It is skipped when `QUICK = True`.

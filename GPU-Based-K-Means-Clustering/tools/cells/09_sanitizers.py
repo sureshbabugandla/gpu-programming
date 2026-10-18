@@ -63,23 +63,40 @@ else:
         proc = subprocess.run(full, capture_output=True, text=True, env=env)
         output = proc.stdout + proc.stderr
 
-        summary = re.search(r"ERROR SUMMARY: (\d+) error", output)
+        # The tools do not all end the same way. memcheck, initcheck and synccheck print
+        #     ERROR SUMMARY: N errors
+        # while racecheck prints
+        #     RACECHECK SUMMARY: N hazards displayed (E errors, W warnings)
+        # and nothing else. Both forms are accepted, and whichever counts are present must all be
+        # zero: a racecheck warning is a possible hazard the tool could not prove, so it is not
+        # something to pass over (§16.4 asks for 0 hazards).
+        error_summary = re.search(r"ERROR SUMMARY: (\d+) error", output)
+        race_summary = re.search(
+            r"RACECHECK SUMMARY: (\d+) hazards? displayed "
+            r"\((\d+) errors?, (\d+) warnings?\)", output)
         leaked = re.search(r"LEAK SUMMARY: (\d+) bytes leaked", output)
-        errors = int(summary.group(1)) if summary else None
-        leak_bytes = int(leaked.group(1)) if leaked else None
+
+        counts = []
+        if error_summary is not None:
+            counts.append(("errors", int(error_summary.group(1))))
+        if race_summary is not None:
+            hazards, race_errors, warnings = (int(g) for g in race_summary.groups())
+            counts.append(("hazards", hazards))
+            if error_summary is None:
+                counts.append(("errors", race_errors))
+            counts.append(("warnings", warnings))
+        if leaked is not None:
+            counts.append(("B leaked", int(leaked.group(1))))
 
         problems = []
-        if errors is None:
-            problems.append("no ERROR SUMMARY line in the output: the tool did not run to "
-                            "completion")
-        elif errors != 0:
-            problems.append(f"{errors} error(s)")
-        if leak_bytes not in (None, 0):
-            problems.append(f"{leak_bytes} bytes leaked")
+        if error_summary is None and race_summary is None:
+            # Not a clean run with an unrecognised format: no summary at all means the tool did
+            # not reach the end, so there is nothing to conclude and the case must not pass.
+            problems.append("neither an ERROR SUMMARY nor a RACECHECK SUMMARY line in the "
+                            "output: the tool did not run to completion")
+        problems += [f"{value} {name}" for name, value in counts if value != 0]
 
-        detail = f"{errors if errors is not None else '?'} errors"
-        if leak_bytes is not None:
-            detail += f", {leak_bytes} B leaked"
+        detail = ", ".join(f"{value} {name}" for name, value in counts) or "no counts reported"
         print(f"  {'ok  ' if not problems else 'FAIL'} {test_id:<4} {tool:<10} {label:<46} "
               f"{detail}")
         if problems:
