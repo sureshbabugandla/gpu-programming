@@ -79,8 +79,11 @@ struct RunReport {
 
     double objective = 0.0;
 
-    // PERF-001: PASS or FAIL from --verify, NOT_CHECKED without it.
+    // PERF-001: PASS, PASS_SAMPLED, FAIL or FAIL_SAMPLED from --verify, NOT_CHECKED without it.
+    // The _SAMPLED forms say that the P1 half of the gate ran on the PERF-001 sample rather than
+    // on every point; `p1_check_mode` carries the §13.1 detail, "full" or "sampled:<size>".
     std::string correctness_status = "NOT_CHECKED";
+    std::string p1_check_mode = "NA";
 
     std::vector<uint32_t> counts;  // n_final, the third FR-015 output
 };

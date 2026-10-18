@@ -475,10 +475,37 @@ FinalVerification verify_final(const float *X, const Result &result, const Confi
     const int64_t D = config.D;
     const int64_t K = config.K;
 
-    // P1: the reported assignment of every point must be the nearest reported centroid under the
-    // reference's binary32 distance path. A disagreement is a failure unless the point is a
-    // near-tie, where FMA contraction alone can reorder two candidates (NUM-005).
-    for (int64_t i = 0; i < N; ++i) {
+    // PERF-001: full P1 below the threshold, a fixed seeded stratified sample above it. The
+    // sample is one point drawn uniformly from each of kP1SampleSize equal strata of [0, N),
+    // which spreads the sample over the whole array and draws no index twice; splitmix64 on a
+    // fixed seed makes it reproducible from the seed and the shape alone.
+    const double terms = static_cast<double>(N) * static_cast<double>(K) *
+                         static_cast<double>(D);
+    v.p1_sampled = N > kP1SampleSize && terms > static_cast<double>(kP1FullCheckTerms);
+    v.p1_points_checked = v.p1_sampled ? kP1SampleSize : N;
+    v.p1_mode = v.p1_sampled ? "sampled:" + std::to_string(kP1SampleSize) : std::string("full");
+
+    uint64_t rng_state = kP1SampleSeed;
+    const auto next_random = [&rng_state]() {
+        rng_state += 0x9E3779B97F4A7C15ULL;
+        uint64_t z = rng_state;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        return z ^ (z >> 31);
+    };
+
+    // P1: the reported assignment of every checked point must be the nearest reported centroid
+    // under the reference's binary32 distance path. A disagreement is a failure unless the point
+    // is a near-tie, where FMA contraction alone can reorder two candidates (NUM-005).
+    for (int64_t s = 0; s < v.p1_points_checked; ++s) {
+        int64_t i = s;
+        if (v.p1_sampled) {
+            // Stratum [s*N/S, (s+1)*N/S), which is never empty because S < N here.
+            const int64_t lo = (s * N) / kP1SampleSize;
+            const int64_t hi = ((s + 1) * N) / kP1SampleSize;
+            const int64_t width = (hi > lo) ? hi - lo : 1;
+            i = lo + static_cast<int64_t>(next_random() % static_cast<uint64_t>(width));
+        }
         const float *point = X + i * D;
         const int32_t expected = cpu::nearest_centroid(point, D, result.centroids.data(), K);
         const int32_t got = result.assignments[static_cast<size_t>(i)];

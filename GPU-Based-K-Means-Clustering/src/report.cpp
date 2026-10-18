@@ -200,6 +200,7 @@ std::string summary_json(const RunReport &report)
            std::string(report.assignment_consistent ? "true" : "false") + ",\n";
     out += "  \"objective\": " + json_num(report.objective) + ",\n";
     out += "  \"correctness_status\": " + json_string(report.correctness_status) + ",\n";
+    out += "  \"p1_check_mode\": " + json_string(report.p1_check_mode) + ",\n";
 
     out += "  \"configuration\": {\n";
     out += "    \"N\": " + std::to_string(c.N) + ",\n";
@@ -281,7 +282,7 @@ std::string csv_header()
            "assignment_consistent,t_alg_ms,t_e2e_ms,t_alloc_ms,t_h2d_ms,t_d2h_ms,t_assign_ms,"
            "t_accum_ms,t_update_ms,t_conv_ms,objective_J,correctness_status,gpu_name,"
            "compute_capability,sm_count,driver_version,cuda_runtime,nvcc_version,host_compiler,"
-           "os,build_flags\n";
+           "os,build_flags,p1_check_mode\n";
 }
 
 std::string csv_row(const RunReport &report)
@@ -341,7 +342,9 @@ std::string csv_row(const RunReport &report)
     r += csv_field(report.env.nvcc_version) + ",";
     r += csv_field(report.env.host_compiler) + ",";
     r += csv_field(report.env.os) + ",";
-    r += csv_field(report.env.build_flags);
+    r += csv_field(report.env.build_flags) + ",";
+    // PERF-001 (v1.9): which points the P1 half of the gate actually looked at.
+    r += csv_field(na_or(report.p1_check_mode));
     r += "\n";
     return r;
 }

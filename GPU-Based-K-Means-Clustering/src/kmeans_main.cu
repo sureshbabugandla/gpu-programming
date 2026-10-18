@@ -406,16 +406,28 @@ int main(int argc, char **argv)
     if (opt.verify == VerifyMode::kFinal) {
         const gpu::FinalVerification fv =
             gpu::verify_final(x_ptr, result, run_options.config, m_range);
-        std::printf("verify final: P1 hard mismatches %lld, near-tie mismatches %lld, P2 flag %s, "
-                    "max |C_final - mean| %.3e\n",
+        std::printf("verify final: P1 over %lld point(s) [%s], hard mismatches %lld, near-tie "
+                    "mismatches %lld, P2 flag %s, max |C_final - mean| %.3e\n",
+                    static_cast<long long>(fv.p1_points_checked), fv.p1_mode.c_str(),
                     static_cast<long long>(fv.p1_hard_mismatches),
                     static_cast<long long>(fv.p1_near_tie_mismatches),
                     fv.p2_flag_correct ? "correct" : "WRONG", fv.max_centroid_difference);
+        if (fv.p1_sampled) {
+            // PERF-001 (v1.9): say what the result does not cover, at the place where it is
+            // produced, so a sampled gate cannot be read as a full one further downstream.
+            std::printf("  note[PERF-001]: N*K*D exceeds %lld, so P1 was checked on a fixed "
+                        "seeded sample of %lld points, one per stratum; it is evidence about "
+                        "those points only. P2 was checked in full.\n",
+                        static_cast<long long>(gpu::kP1FullCheckTerms),
+                        static_cast<long long>(fv.p1_points_checked));
+        }
         for (const std::string &line : fv.reports) {
             std::printf("  %s\n", line.c_str());
         }
         const bool passed = fv.p1_hard_mismatches == 0 && fv.p2_flag_correct;
-        report.correctness_status = passed ? "PASS" : "FAIL";
+        report.p1_check_mode = fv.p1_mode;
+        report.correctness_status = passed ? (fv.p1_sampled ? "PASS_SAMPLED" : "PASS")
+                                           : (fv.p1_sampled ? "FAIL_SAMPLED" : "FAIL");
         if (!passed) {
             report_error("FR-019", "verification failed: " +
                                        std::to_string(fv.p1_hard_mismatches) +
@@ -429,6 +441,9 @@ int main(int argc, char **argv)
             std::printf("  note: %s\n", note.c_str());
         }
         const bool passed = lockstep_ok(lockstep_stats);
+        // Lockstep compares every point at every iteration (§10.3), so its P1 evidence is never
+        // the PERF-001 sample and the column says so.
+        report.p1_check_mode = "full";
         report.correctness_status = passed ? "PASS" : "FAIL";
         if (!passed) {
             report_error("FR-019", "lockstep verification failed: see the notes above; every "

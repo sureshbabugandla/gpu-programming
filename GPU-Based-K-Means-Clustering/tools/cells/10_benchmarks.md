@@ -15,9 +15,17 @@ so a development pass over the notebook stays fast (BLD-007).
 
 which satisfies three requirements at once:
 
-* **PERF-001** — `--verify final` runs the P1/P2 check once, after the repetitions, on the host.
-  It costs no device time and stamps every row of the configuration `correctness_status=PASS` or
-  `FAIL`. A `FAIL` configuration keeps its rows and is excluded from the analysis, never deleted.
+* **PERF-001** (specification v1.9) — `--verify final` runs the P1/P2 check once, after the
+  repetitions, on the host. It costs no device time and stamps every row of the configuration
+  `correctness_status=PASS`, `PASS_SAMPLED`, `FAIL` or `FAIL_SAMPLED`, with the detail in the
+  `p1_check_mode` column. P2, the centroid–mean check, is always performed in full. P1 is
+  performed in full when $NKD \le 2\times10^{10}$ and on a fixed seeded stratified sample of
+  100 000 points above that, because the full P1 is a single-threaded host pass of $NKD$
+  binary32 distance evaluations and at the top of the matrix it costs more than the run it
+  guards. A sampled gate is evidence about the sampled points only; the unsampled P1 evidence
+  for the kernels is the §16.1–§16.2 suite in section 8, which runs at sizes where the full
+  check is affordable. A `FAIL` configuration keeps its rows and is excluded from the analysis,
+  never deleted.
 * **PERF-004** — `--fixed-iters` with $I_{\max} = 20$, so Approach A and Approach B perform the
   same number of updates and the comparison is about the kernels, not about one strategy stopping
   a step earlier. The converging runs are a separate section with their own iteration counts, and
@@ -54,9 +62,19 @@ $4ND$ dataset file. Anything over budget is skipped and listed in the exclusion 
 required bytes and the reason. The list is computed from what this session actually has, not
 predicted here, and nothing is reported as measured that was not (PERF-011).
 
-**Cost, and where it goes.** The plan print below reports, per section, the work the PERF-001
-gate implies: `verify_final` is a single-threaded host pass of $N\,K\,D$ binary32 distance
-evaluations per configuration. For most of the matrix that is small beside the measured run; for
-the tile sweep at $D = 512$, $K = 1024$ it is the dominant cost of the whole section. If a
-session is short, give that section one of its own — `BENCH_SECTIONS = ("tiles",)` — and let the
-resume index join the results to the rest.
+**Tile sizes are checked before they are timed.** `assign_smem` is a template on $T_K$ and
+$T_D$, so every pair in the tile sweep is a different kernel instantiation with a different
+overhang pattern. The section 8 suite establishes SMEM-004 for the default $8\times32$ build
+only; this cell builds a `test_gpu` for each other pair and runs `--only smem` — the hand cases,
+the dataset sweep and the TEST-E16 non-aligned size matrix — before any configuration of that
+build is measured. A pair that fails is blocked and all of its configurations appear in the
+exclusion table, because a timing of a kernel that disagrees with the baseline measures the
+wrong thing (SMEM-004 before SMEM-005).
+
+**Estimated run time.** The plan print below gives, per section, how many configurations are not
+yet measured and roughly how long they will take, so a section can be given a session of its own
+through `BENCH_SECTIONS` when the whole matrix does not fit one. The estimate is a model — the
+assignment pass at a nominal rate, plus the PERF-001 gate at a nominal host rate — and it says
+so; once `bench_progress.json` holds three or more completed configurations the model is
+calibrated against their measured wall times and the print says what it was calibrated on. It is
+an estimate for planning, never a measurement (PERF-011).

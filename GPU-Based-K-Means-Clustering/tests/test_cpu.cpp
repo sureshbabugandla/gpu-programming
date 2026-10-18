@@ -1110,6 +1110,7 @@ RunReport sample_report()
     r.t_e2e_ms = 20.25;
     r.objective = 1234.5;
     r.correctness_status = "PASS";
+    r.p1_check_mode = "full";
     r.counts = {400, 350, 250};
     r.run_id = make_run_id(r);
     return r;
@@ -1184,6 +1185,34 @@ void test_i08_reporting()
               "the four PERF-007 phase columns are NA outside phase-timing mode");
         check(summary_json(r).find("\"t_assign\": null") != std::string::npos,
               "and null in the JSON summary, where 0 would claim a phase took no time");
+    }
+
+    {
+        // PERF-001 (v1.9): the gate's P1 half may run on a sample, and the row has to say so in
+        // both places a reader looks -- the status and the mode column -- because a
+        // PASS_SAMPLED averaged into a table of PASS rows would overstate what was checked.
+        TestScope scope("I08", "PERF-001: the P1 check mode is reported in the row and the JSON");
+        RunReport r = sample_report();
+        const std::string full_row = csv_row(r);
+        check(full_row.find(",full\n") != std::string::npos,
+              "a full check writes p1_check_mode=full as the last column: " +
+                  full_row.substr(full_row.size() - 60));
+        check(summary_json(r).find("\"p1_check_mode\": \"full\"") != std::string::npos,
+              "and the JSON summary carries it too");
+
+        r.correctness_status = "PASS_SAMPLED";
+        r.p1_check_mode = "sampled:100000";
+        const std::string row = csv_row(r);
+        check(row.find(",PASS_SAMPLED,") != std::string::npos,
+              "a sampled gate is PASS_SAMPLED, not PASS: " + row.substr(0, 400));
+        check(row.find(",sampled:100000\n") != std::string::npos,
+              "and the mode column names the sample size");
+
+        r.verify = VerifyMode::kNone;
+        r.correctness_status = "NOT_CHECKED";
+        r.p1_check_mode = "";
+        check(csv_row(r).find(",NA\n") != std::string::npos,
+              "with no verification the mode column is NA, not an empty field");
     }
 
     {

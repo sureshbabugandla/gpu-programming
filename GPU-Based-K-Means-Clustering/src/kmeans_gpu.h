@@ -111,6 +111,14 @@ inline Result run(const float *X, const float *C0, const Options &options, RunIn
 
 // --- FR-019 `final` verification ---------------------------------------------------------------
 
+// PERF-001 (specification v1.9): P1 costs N*K*D binary32 distance evaluations on the host, which
+// at the top of the PERF-003 matrix exceeds the cost of the run it guards. Above this many terms
+// the check is made on a fixed seeded sample instead, and the mode is reported with the result.
+// P2 is O(N*D) and is never sampled.
+constexpr int64_t kP1FullCheckTerms = 20000000000LL;  // 2e10
+constexpr int64_t kP1SampleSize = 100000;
+constexpr uint64_t kP1SampleSeed = 0x5EEDC0DEULL;  // fixed, so the sample is reproducible
+
 struct FinalVerification {
     int64_t p1_hard_mismatches = 0;       // non-near-tie disagreements: failures (NUM-005)
     int64_t p1_near_tie_mismatches = 0;   // near-tie disagreements: reported, not failures
@@ -118,6 +126,12 @@ struct FinalVerification {
     bool reference_p2 = false;
     double max_centroid_difference = 0.0;
     std::vector<std::string> reports;     // one line per near-tie or hard mismatch
+
+    // PERF-001 mode. `p1_points_checked` is N for a full check and kP1SampleSize for a sampled
+    // one; `p1_mode` is the §13.1 `p1_check_mode` value, "full" or "sampled:<size>".
+    bool p1_sampled = false;
+    int64_t p1_points_checked = 0;
+    std::string p1_mode = "full";
 };
 
 // P1: every reported assignment is the nearest reported centroid, judged with the CPU reference's

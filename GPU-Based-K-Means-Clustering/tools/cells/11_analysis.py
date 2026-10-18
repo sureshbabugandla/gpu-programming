@@ -127,7 +127,7 @@ if RAW is not None:
 
     CONFIG_COLS = ["N", "D", "K", "strategy", "assign_kernel", "block_size", "tile_k", "tile_d",
                    "requested_G", "reduce_chunks_G", "max_iter", "fixed_iters",
-                   "correctness_status"]
+                   "correctness_status", "p1_check_mode"]
     per_config = RAW.groupby(CONFIG_COLS, dropna=False).agg(
         reps=("t_alg_ms", "count"),
         t_alg_median=("t_alg_ms", "median"), t_alg_mean=("t_alg_ms", "mean"),
@@ -147,9 +147,21 @@ if RAW is not None:
         gate_failures.append(f"TEST-P04: {len(short)} configuration(s) with fewer than 10 reps")
         show(short[CONFIG_COLS + ["reps"]])
 
-    failed = per_config[per_config["correctness_status"] != "PASS"]
+    # PERF-001 (specification v1.9): PASS_SAMPLED is a pass whose P1 half ran on the fixed
+    # sample rather than on every point. It counts as verified for the purpose of keeping the
+    # row, and the count of such configurations is printed because the distinction is the whole
+    # reason the column exists -- a sampled gate must never be read as a full one.
+    PASSING = ["PASS", "PASS_SAMPLED"]
+    failed = per_config[~per_config["correctness_status"].isin(PASSING)]
+    sampled = per_config[per_config["correctness_status"] == "PASS_SAMPLED"]
     print(f"PERF-001  correctness gate: {len(per_config) - len(failed)} of {len(per_config)} "
-          f"configurations passed --verify final")
+          f"configurations passed --verify final; of those, {len(sampled)} had P1 checked on "
+          f"the sample rather than on every point (P2 is full everywhere)")
+    if len(sampled):
+        show(sampled[["N", "D", "K", "strategy", "assign_kernel", "p1_check_mode",
+                      "correctness_status", "reps"]],
+             "P1 for these configurations is evidence about the sampled points only; the "
+             "unsampled P1 evidence for the kernels is the §16.1-§16.2 suite.")
     if len(failed):
         print("  the following are excluded from every figure below and from any performance "
               "conclusion:")
@@ -165,7 +177,7 @@ if RAW is not None:
         print("  every validity check holds for the rows in this file")
 
     # Everything below works on the verified rows only.
-    OK = per_config[per_config["correctness_status"] == "PASS"].copy()
+    OK = per_config[per_config["correctness_status"].isin(PASSING)].copy()
     DEFAULT_TILE = (OK["tile_k"].astype(str) == "NA") | \
                    ((OK["tile_k"].astype(str) == "8") & (OK["tile_d"].astype(str) == "32"))
     AUTO_G = OK["requested_G"].isin(["auto", "unknown"])

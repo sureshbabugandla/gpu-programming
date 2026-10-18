@@ -27,6 +27,10 @@ def table(frame, columns=None, note=None):
         print(f"  {note}")
 
 
+# PERF-001 (v1.9): a sampled gate is still a pass, and is kept, but it is never silently
+# merged with a full one -- the p1_check_mode column travels with every table below.
+PASSING = ["PASS", "PASS_SAMPLED"]
+
 raw = pd.read_csv(RAW_CSV, keep_default_na=False) if os.path.exists(RAW_CSV) else None
 summary = pd.read_csv(SUMMARY_CSV) if os.path.exists(SUMMARY_CSV) else None
 phases = pd.read_csv(PHASES_CSV, keep_default_na=False) if os.path.exists(PHASES_CSV) else None
@@ -40,7 +44,10 @@ if raw is None or not len(raw):
 else:
     env_cols = ["gpu_name", "compute_capability", "sm_count", "driver_version", "cuda_runtime",
                 "nvcc_version", "host_compiler", "os", "build_flags", "git_commit"]
-    print("PERF-008 environment of the rows in bench_raw.csv (one line per distinct record):")
+    print("PERF-001 gate modes over the rows (v1.9: P2 always full, P1 full or sampled):")
+    table(raw.groupby(["correctness_status", "p1_check_mode"]).size()
+          .reset_index(name="rows"))
+    print("\nPERF-008 environment of the rows in bench_raw.csv (one line per distinct record):")
     table(raw[env_cols].drop_duplicates())
     print(f"\nrows: {len(raw)};  configurations: "
           f"{len(summary) if summary is not None else 'unknown'};  "
@@ -58,7 +65,7 @@ if summary is None:
     print("  no bench_summary.csv")
 else:
     keyed = summary[(summary["fixed_iters"] == 1) &
-                    (summary["correctness_status"] == "PASS")].copy()
+                    (summary["correctness_status"].isin(PASSING))].copy()
     pivot_strategy = keyed.pivot_table(index=["N", "D", "K", "assign_kernel", "block_size"],
                                        columns="strategy", values="t_alg_median",
                                        aggfunc="median")
@@ -82,11 +89,13 @@ block("12.4  scaling in N, D and K")
 if summary is None:
     print("  no bench_summary.csv")
 else:
-    sweeps = summary[(summary["fixed_iters"] == 1) & (summary["correctness_status"] == "PASS") &
+    sweeps = summary[(summary["fixed_iters"] == 1) &
+                     (summary["correctness_status"].isin(PASSING)) &
                      (summary["block_size"] == 256)]
     table(sweeps.sort_values(["D", "K", "N", "strategy", "assign_kernel"]),
           ["N", "D", "K", "strategy", "assign_kernel", "reduce_chunks_G", "reps",
-           "t_alg_median", "t_alg_std", "t_alg_cv", "t_alg_per_iteration_ms", "t_e2e_median"],
+           "t_alg_median", "t_alg_std", "t_alg_cv", "t_alg_per_iteration_ms", "t_e2e_median",
+           "p1_check_mode"],
           "t_alg_per_iteration_ms is T_alg / (t + 1) (PERF-004).")
 
 # --- 12.5 -----------------------------------------------------------------------------------------
@@ -94,7 +103,7 @@ block("12.5  block size, reduction chunks G, tile sizes")
 if summary is None:
     print("  no bench_summary.csv")
 else:
-    ok = summary[summary["correctness_status"] == "PASS"]
+    ok = summary[summary["correctness_status"].isin(PASSING)]
     print("block size:")
     table(ok[ok["block_size"] != 256].sort_values(["N", "D", "K", "block_size", "strategy"]),
           ["N", "D", "K", "strategy", "assign_kernel", "block_size", "t_alg_median", "t_alg_cv"],

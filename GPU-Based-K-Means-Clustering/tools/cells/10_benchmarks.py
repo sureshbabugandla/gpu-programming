@@ -59,6 +59,21 @@ DEFAULT_TILES = (8, 32)
 # allowed to hold the session open.
 PER_CONFIG_TIMEOUT_S = 7200
 
+# PERF-001 (specification v1.9), mirroring kP1FullCheckTerms and kP1SampleSize in kmeans_gpu.h.
+# P2 is always checked in full; P1 is full below the threshold and a fixed seeded stratified
+# sample of this many points above it. Only used here to estimate the gate's cost -- the
+# executable makes the decision and records it in the p1_check_mode column.
+P1_FULL_LIMIT_TERMS = 2.0e10
+P1_SAMPLE_SIZE = 100000
+
+# Nominal rates for the run-time estimate below. They are assumptions about a T4, not
+# measurements, and they are replaced by a calibration as soon as bench_progress.json holds
+# completed configurations to calibrate against. The model counts only the assignment pass,
+# which dominates for every K in the matrix (PERF-010: ~3NKD flops per pass).
+NOMINAL_DEVICE_TERMS_PER_S = 5.0e11   # N*K*D distance terms per second in one assign pass
+NOMINAL_GATE_TERMS_PER_S = 3.0e8      # the same terms on one host core inside verify_final
+NOMINAL_RUN_OVERHEAD_S = 1.0          # per run: allocation, H2D, D2H and the host transpose
+
 RAW_CSV = os.path.join(CSV_DIR, "bench_raw.csv")
 SUMMARY_CSV = os.path.join(CSV_DIR, "bench_summary.csv")
 PHASES_CSV = os.path.join(CSV_DIR, "bench_phases.csv")
@@ -88,6 +103,46 @@ def config_key(c):
     return (f"n{c['N']}_d{c['D']}_k{c['K']}|{c['strategy']}|{c['assign']}|b{c['block']}"
             f"|g{c['g']}|tk{c['tile_k']}td{c['tile_d']}|i{MAX_ITER}"
             f"|{'fixed' if c['fixed'] else 'converge'}|{'phases' if c['phases'] else 'plain'}")
+
+
+def gate_terms(c):
+    """Host-side distance terms the PERF-001 gate costs for this configuration (v1.9)."""
+    terms = float(c["N"]) * c["K"] * c["D"]
+    if c["N"] > P1_SAMPLE_SIZE and terms > P1_FULL_LIMIT_TERMS:
+        return float(P1_SAMPLE_SIZE) * c["K"] * c["D"]
+    return terms
+
+
+def estimated_seconds(c, scale=1.0):
+    """Rough wall time for one configuration: warm-ups and repetitions on the device, plus the
+    one host gate. `scale` is the calibration factor from configurations already measured."""
+    runs = REPS + WARMUP
+    passes = MAX_ITER + 2  # one assign per iteration, plus the initial pass and finalization
+    device = runs * (passes * float(c["N"]) * c["K"] * c["D"] / NOMINAL_DEVICE_TERMS_PER_S +
+                     NOMINAL_RUN_OVERHEAD_S)
+    gate = gate_terms(c) / NOMINAL_GATE_TERMS_PER_S
+    return scale * (device + gate)
+
+
+def calibration(progress):
+    """(scale, n) from completed configurations: the median of measured over predicted seconds.
+
+    Three completed configurations is the minimum worth trusting; below that the nominal rates
+    stand and the printout says so, because an estimate presented as calibrated when it is not
+    would be the same kind of claim PERF-011 forbids about measurements.
+    """
+    ratios = []
+    for record in progress.values():
+        config_fields, seconds = record.get("config"), record.get("seconds")
+        if not config_fields or not seconds:
+            continue
+        predicted = estimated_seconds(config_fields)
+        if predicted > 0:
+            ratios.append(seconds / predicted)
+    if len(ratios) < 3:
+        return 1.0, 0
+    ratios.sort()
+    return ratios[len(ratios) // 2], len(ratios)
 
 
 def build_plan():
@@ -286,21 +341,59 @@ def binary_for(tiles):
     return "./kmeans" if tuple(tiles) == DEFAULT_TILES else f"./kmeans_tk{tiles[0]}_td{tiles[1]}"
 
 
+def check_smem_build(tiles):
+    """SMEM-004 before SMEM-005: assign_smem must match the baseline for THESE tile sizes.
+
+    The section 8 suite establishes that for the default (8, 32) build only. Every other pair is
+    a different template instantiation of assign_smem with a different tile geometry and a
+    different overhang pattern, so each build is put through the same `test_gpu --only smem`
+    comparison -- hand cases, the dataset sweep and the TEST-E16 non-aligned size matrix -- and
+    its benchmark numbers are kept only if that passes. Returns None on success, or the reason
+    the build is rejected.
+    """
+    target = f"test_gpu_tk{tiles[0]}_td{tiles[1]}"
+    if not os.path.exists(target):
+        compile_cuda(target, ["test_gpu.cu"] + CUDA_SOURCES + HOST_SOURCES,
+                     extra_flags=[f"-DKMEANS_TILE_K={tiles[0]}", f"-DKMEANS_TILE_D={tiles[1]}"])
+    proc = subprocess.run([f"./{target}", "--only", "smem"], capture_output=True, text=True,
+                          timeout=PER_CONFIG_TIMEOUT_S)
+    output = (proc.stdout + proc.stderr).strip()
+    tail = "\n".join(output.splitlines()[-6:])
+    print(f"  SMEM-004 for T_K={tiles[0]}, T_D={tiles[1]}: exit {proc.returncode}\n{tail}")
+    if proc.returncode != 0:
+        return (f"SMEM-004 failed for T_K={tiles[0]}, T_D={tiles[1]}: assign_smem does not match "
+                f"the baseline assign for this build (test_gpu --only smem exited "
+                f"{proc.returncode}), so its timings are not measurements of a correct kernel")
+    return None
+
+
 def build_tile_binaries(plan):
-    """Compile one executable per tile pair the plan needs, with the section 6 compile helper."""
+    """Compile one executable per tile pair the plan needs and gate each one on SMEM-004.
+
+    Returns {tiles: reason} for the pairs whose configurations must not be measured.
+    """
+    blocked = {}
     wanted = {(c["tile_k"], c["tile_d"]) for c in plan} - {DEFAULT_TILES}
     if not wanted:
-        return
+        return blocked
     if "compile_cuda" not in globals():
         raise RuntimeError("The tile sweep needs the CUDA compile cell (section 6) to have run: "
                            "compile_cuda is not defined.")
+    print(f"\nthe default tiles {DEFAULT_TILES[0]}x{DEFAULT_TILES[1]} are covered by the "
+          "section 8 suite; every other pair is built and checked against the baseline here "
+          "before it is benchmarked (SMEM-004)")
     for tiles in sorted(wanted):
         target = binary_for(tiles)[len("./"):]
-        if os.path.exists(target):
-            continue
-        print(f"\nbuilding {target} (SMEM-001: T_K and T_D are compile-time constants)")
-        compile_cuda(target, ["kmeans_main.cu"] + CUDA_SOURCES + HOST_SOURCES,
-                     extra_flags=[f"-DKMEANS_TILE_K={tiles[0]}", f"-DKMEANS_TILE_D={tiles[1]}"])
+        if not os.path.exists(target):
+            print(f"\nbuilding {target} (SMEM-001: T_K and T_D are compile-time constants)")
+            compile_cuda(target, ["kmeans_main.cu"] + CUDA_SOURCES + HOST_SOURCES,
+                         extra_flags=[f"-DKMEANS_TILE_K={tiles[0]}",
+                                      f"-DKMEANS_TILE_D={tiles[1]}"])
+        reason = check_smem_build(tiles)
+        if reason:
+            blocked[tiles] = reason
+            print(f"  BLOCKED: {reason}")
+    return blocked
 
 
 def auto_chunks(N, D, K, x_path, c_path):
@@ -328,7 +421,7 @@ def resolve_chunks(c, auto_g):
     return max(1, auto_g // 4) if c["g"] == "quarter" else auto_g * 4
 
 
-def run_one(c, auto_g, needed_later, progress, excluded):
+def run_one(c, auto_g, needed_later, progress, excluded, blocked_tiles=None):
     """Measure one configuration. Appends rows to the raw or phase CSV, or an exclusion."""
     key = config_key(c)
     csv_path = PHASES_CSV if c["phases"] else RAW_CSV
@@ -347,6 +440,12 @@ def run_one(c, auto_g, needed_later, progress, excluded):
             return
         if recorded & present:
             purge_rows(csv_path, recorded & present)
+
+    blocked = (blocked_tiles or {}).get((c["tile_k"], c["tile_d"]))
+    if blocked:
+        excluded.append({**c, "reason": blocked})
+        print(f"  SKIP  {label}\n        {blocked}")
+        return
 
     g_value = resolve_chunks(c, auto_g)
     if c["strategy"] == "reduction" and c["g"] != "auto" and g_value is None:
@@ -414,7 +513,8 @@ def run_one(c, auto_g, needed_later, progress, excluded):
     # automatic one at the same point.
     progress[key] = {"run_ids": new_ids, "csv": os.path.basename(csv_path),
                      "section": c["section"], "g": c["g"], "block": c["block"],
-                     "tiles": [c["tile_k"], c["tile_d"]], "seconds": round(elapsed, 1)}
+                     "tiles": [c["tile_k"], c["tile_d"]], "seconds": round(elapsed, 1),
+                     "config": c}
     save_progress(progress)
 
     median = next((line for line in output.splitlines() if line.startswith("t_alg_ms")), "")
@@ -422,8 +522,12 @@ def run_one(c, auto_g, needed_later, progress, excluded):
     print(f"  ok    {label}  [{elapsed:.1f} s]")
     if median:
         print(f"        {median}")
+    if verify:
+        # PERF-001 v1.9: the line says whether P1 was full or sampled, which decides whether the
+        # rows are PASS/FAIL or PASS_SAMPLED/FAIL_SAMPLED.
+        print(f"        {verify}")
     if proc.returncode == 6:
-        print(f"        correctness_status=FAIL (PERF-001): {verify or diagnostic(output)}")
+        print(f"        gate FAILED (PERF-001): rows are kept and excluded from the analysis")
 
 
 def diagnostic(output):
@@ -514,7 +618,8 @@ def compare_strategies(N, D, K, needed_later, excluded):
 # averaging a FAIL run together with a PASS one.
 SUMMARY_GROUP = ["dataset_id", "N", "D", "K", "strategy", "assign_kernel", "accum_precision",
                  "block_size", "tile_k", "tile_d", "reduce_chunks_G", "max_iter", "tolerance",
-                 "fixed_iters", "correctness_status", "gpu_name", "compute_capability",
+                 "fixed_iters", "correctness_status", "p1_check_mode", "gpu_name",
+                 "compute_capability",
                  "sm_count", "driver_version", "cuda_runtime", "nvcc_version", "host_compiler",
                  "os", "build_flags"]
 
@@ -557,18 +662,28 @@ for _prefix, _shape in [(dataset_paths(n, d, k)[0], (n, d, k))
 
 print(f"PERF-003 plan: {len(PLAN)} configuration(s) x {REPS} measured repetitions "
       f"({WARMUP} warm-ups each), I_max = {MAX_ITER}, tol = {TOL}")
-# The PERF-001 gate is a host pass of N*K*D binary32 distance evaluations per configuration
-# (verify_final in kmeans_gpu.cu), single-threaded, and at the top of the matrix it costs more
-# than the measured run itself. Printing the work per section is what makes the cost visible
-# before a session is spent on it; a heavy section can be given a session of its own through
-# BENCH_SECTIONS.
+# The estimate is what makes BENCH_SECTIONS usable: a section can be given a session of its
+# own if its number here does not fit the session that is available. It is a model, not a
+# measurement -- the nominal rates above, calibrated against the configurations this CSV has
+# already measured once there are at least three of them.
+PROGRESS_SO_FAR = load_progress()
+SCALE, CALIBRATED_ON = calibration(PROGRESS_SO_FAR)
+total_estimate = 0.0
 for section in BENCH_SECTIONS:
     members = [c for c in PLAN if c["section"] == section]
     if members:
         shapes = sorted({(c["N"], c["D"], c["K"]) for c in members})
-        gate = sum(c["N"] * c["K"] * c["D"] for c in members)
+        remaining = [c for c in members if config_key(c) not in PROGRESS_SO_FAR]
+        seconds = sum(estimated_seconds(c, SCALE) for c in remaining)
+        total_estimate += seconds
+        gate = sum(gate_terms(c) for c in members)
         print(f"  {section:9s} {len(members):3d} configuration(s) over {len(shapes)} dataset(s), "
-              f"PERF-001 gate work {gate:.3e} point-centroid distances")
+              f"{len(remaining):3d} not yet measured, estimated {seconds / 60:6.1f} min, "
+              f"PERF-001 gate work {gate:.2e} point-centroid distances")
+basis = (f"calibrated on {CALIBRATED_ON} measured configuration(s)" if CALIBRATED_ON else
+         "nominal rates, not calibrated: no measured configuration to calibrate on")
+print(f"  total     estimated {total_estimate / 60:.1f} min for what is not yet measured "
+      f"({basis})")
 _dataset_bytes = sum(4 * n * d + 4 * k * d for n, d, k in {(c["N"], c["D"], c["K"]) for c in PLAN})
 print(f"  datasets   {_dataset_bytes / 2**30:.2f} GiB on local disk at {BENCH_DATA_DIR}")
 print(f"  CSVs       {CSV_DIR}")
@@ -580,7 +695,7 @@ if not BENCH:
 else:
     os.makedirs(BENCH_DATA_DIR, exist_ok=True)
     os.makedirs(BENCH_OUT_DIR, exist_ok=True)
-    progress = load_progress()
+    progress = PROGRESS_SO_FAR
     if not progress and os.path.exists(RAW_CSV) and len(csv_run_ids(RAW_CSV)):
         print(f"warning: {RAW_CSV} holds rows but the resume index is empty, so every "
               "configuration will be measured again and the file will hold two sets of rows for "
@@ -588,7 +703,7 @@ else:
     excluded = []
     started_all = time.time()
 
-    build_tile_binaries(PLAN)
+    blocked_tiles = build_tile_binaries(PLAN)
 
     # The G sweep needs the automatic G of the base point before it can ask for a quarter of it.
     auto_g = None
@@ -605,7 +720,7 @@ else:
     print(f"\n{'=' * 110}\nmeasuring\n{'=' * 110}")
     for index, c in enumerate(PLAN):
         needed_later = {(later["N"], later["D"], later["K"]) for later in PLAN[index + 1:]}
-        run_one(c, auto_g, needed_later, progress, excluded)
+        run_one(c, auto_g, needed_later, progress, excluded, blocked_tiles)
 
     # --- TEST-I09 at benchmark scale
     numeric_rows = []

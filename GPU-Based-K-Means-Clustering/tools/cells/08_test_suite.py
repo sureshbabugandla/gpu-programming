@@ -269,6 +269,12 @@ if code == 0:
         check(field in summary, f"FR-015 field {field!r} is present in the summary")
     check(summary["correctness_status"] == "PASS",
           f"--verify final reported {summary['correctness_status']}")
+    # PERF-001 (v1.9): N*K*D here is far below the 2e10 threshold, so the gate must have checked
+    # every point. A sampled result on a dataset this small would mean the threshold logic is
+    # wrong, which matters because the benchmark rows are judged by the same code.
+    check(summary["p1_check_mode"] == "full",
+          f"P1 was checked in full on a {cfg['N']}x{cfg['D']} dataset with K={cfg['K']}: "
+          f"got {summary['p1_check_mode']}")
     check(summary["assignment_consistent"] is True, "P1 holds by construction (§2.8)")
     timing = summary["timing_ms"]
     check(timing["t_alg"] <= timing["t_e2e"],
